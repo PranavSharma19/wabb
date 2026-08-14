@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Optional local microphone + speech-to-text pipeline.
+faster-whisper>=1.2,<2
+numpy>=1.26,<3
+sounddevice>=0.5,<1

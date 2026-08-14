@@ -1,0 +1,4 @@
+-r requirements-voice.txt
+
+# Fixed-resolution handheld interface.
+pygame>=2.6,<3
