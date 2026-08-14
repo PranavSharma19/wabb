@@ -376,4 +376,5 @@ python -m pytest -q
 
 Coverage includes name normalization, company and school aliases, location matching, scoring, deterministic sorting, criteria refinement and confirmation editing, caching, query sanitization, the service's 10-result/cached-request behavior, countdown/early-stop WAV capture, local-only model loading, transcript assembly, model reuse, and temporary-audio cleanup. Device tests cover hold/release transitions, confirmation-before-search, spoken corrections, cancellation, stale events, retry, profile navigation/selection, keyboard-action mapping, and headless rendering of every state at exactly 800×480. Tests inject fake audio/model/search backends and never access a microphone, download a model, or call X.
 #   w a b b  
+ #   w a b b  
  
