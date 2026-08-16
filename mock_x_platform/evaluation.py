@@ -19,6 +19,7 @@ import requests
 from config import PROJECT_ROOT, load_settings
 from models.candidate import Candidate
 from models.criteria import RecipientCriteria
+from ranking.normalization import normalize_text
 from ranking.ranker import rank_candidates
 from search.query_builder import build_search_query
 
@@ -42,6 +43,7 @@ MISSING_VARIANTS = {"without_school", "without_role", "without_location"}
 class EvaluationRow:
     case_id: int
     variant: str
+    tier: str
     expected_profile_id: str
     query: str
     retrieved: bool
@@ -89,6 +91,7 @@ def run_evaluation(
         raise RuntimeError("No evaluation cases exist. Generate the dataset first.")
 
     application = MockXApplication(store)
+    labels = store.profile_labels(str(case["expected_profile_id"]) for case in cases)
     rows: list[EvaluationRow] = []
     started = time.perf_counter()
     total = len(cases) * len(VARIANT_NAMES)
@@ -96,13 +99,16 @@ def run_evaluation(
     completed = 0
     for case in cases:
         criteria = RecipientCriteria.from_dict(json.loads(case["criteria_json"]))
+        expected_id = str(case["expected_profile_id"])
+        tier = labels.get(expected_id, {}).get("tier", "unknown")
         for variant, changed in criteria_variants(criteria).items():
             rows.append(
                 _evaluate_one(
                     application,
                     int(case["id"]),
                     variant,
-                    str(case["expected_profile_id"]),
+                    tier,
+                    expected_id,
                     changed,
                 )
             )
@@ -117,6 +123,9 @@ def run_evaluation(
         variant: _search_metrics(row for row in rows if row.variant == variant)
         for variant in VARIANT_NAMES
     }
+    overall_metrics = _search_metrics(rows)
+    tier_metrics, tier_variant_metrics = _tier_metrics(rows)
+    ceiling = _retrieval_ceiling(rows, labels)
     determinism = _determinism_check(application, cases[:determinism_cases])
     http_metrics = _http_load(database, cases, http_requests) if run_http else {}
     checks = _acceptance_checks(variant_metrics, determinism, http_metrics, run_http)
@@ -134,7 +143,12 @@ def run_evaluation(
         "profile_count": store.profile_count(),
         "case_count": len(cases),
         "search_count": len(rows),
+        "tier_counts": store.tier_counts(),
+        "overall": overall_metrics,
         "variants": variant_metrics,
+        "tiers": tier_metrics,
+        "tier_variants": tier_variant_metrics,
+        "retrieval_ceiling": ceiling,
         "determinism": determinism,
         "http_load": http_metrics,
         "acceptance": checks,
@@ -157,6 +171,7 @@ def _evaluate_one(
     application: MockXApplication,
     case_id: int,
     variant: str,
+    tier: str,
     expected_id: str,
     criteria: RecipientCriteria,
 ) -> EvaluationRow:
@@ -172,6 +187,7 @@ def _evaluate_one(
     return EvaluationRow(
         case_id=case_id,
         variant=variant,
+        tier=tier,
         expected_profile_id=expected_id,
         query=query,
         retrieved=expected_id in preliminary_ids,
@@ -189,22 +205,102 @@ def _evaluate_one(
 def _search_metrics(rows: Iterable[EvaluationRow]) -> dict[str, Any]:
     materialized = list(rows)
     ranks = [row.rank for row in materialized]
+    found = [rank for rank in ranks if rank is not None]
     latencies = [row.latency_ms for row in materialized]
     count = len(materialized)
+    if not count:
+        # Tier x variant slices can legitimately be empty on a small run.
+        return {
+            "count": 0,
+            "retrieval_recall": 0.0,
+            "top_1": 0.0,
+            "top_3": 0.0,
+            "top_10": 0.0,
+            "mean_rank_when_found": None,
+            "mean_reciprocal_rank": 0.0,
+            "ranking_top_10_given_retrieved": 0.0,
+            "latency_ms": None,
+        }
     return {
         "count": count,
         "retrieval_recall": _ratio(sum(row.retrieved for row in materialized), count),
         "top_1": _ratio(sum(rank == 1 for rank in ranks), count),
         "top_3": _ratio(sum(rank is not None and rank <= 3 for rank in ranks), count),
         "top_10": _ratio(sum(rank is not None for rank in ranks), count),
+        # Averaged over the searches that found the person at all; a mean rank
+        # over misses would silently mix "ranked badly" with "never retrieved".
+        "mean_rank_when_found": round(sum(found) / len(found), 4) if found else None,
         "mean_reciprocal_rank": round(
-            sum(1 / rank for rank in ranks if rank is not None) / count, 6
+            sum(1 / rank for rank in found) / count, 6
         ),
         "ranking_top_10_given_retrieved": _ratio(
             sum(row.retrieved and row.rank is not None for row in materialized),
             sum(row.retrieved for row in materialized),
         ),
         "latency_ms": _latency_metrics(latencies),
+    }
+
+
+def _tier_metrics(rows: list[EvaluationRow]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recall and mean rank per dirt tier, and per tier x query variant.
+
+    A blended number only says the corpus got harder; the split says which kind
+    of dirt did it.
+    """
+
+    tiers = sorted({row.tier for row in rows})
+    by_tier = {tier: _search_metrics(row for row in rows if row.tier == tier) for tier in tiers}
+    by_tier_variant = {
+        tier: {
+            variant: _search_metrics(
+                row for row in rows if row.tier == tier and row.variant == variant
+            )
+            for variant in VARIANT_NAMES
+        }
+        for tier in tiers
+    }
+    return by_tier, by_tier_variant
+
+
+def _retrieval_ceiling(
+    rows: list[EvaluationRow], labels: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Share of cases a name-primary query can never reach.
+
+    The mock store matches whole tokens, so a person is structurally
+    unreachable when their real name shares no token with the display name or
+    the username. No ranking or parsing change recovers those.
+    """
+
+    # Use the clean variant only: the ceiling is about the profile being
+    # unreachable from a correctly spelled name, not about typo robustness.
+    expected = {row.expected_profile_id: row for row in rows if row.variant == "clean"}
+    per_tier: dict[str, dict[str, Any]] = {}
+    for profile_id, row in expected.items():
+        label = labels.get(profile_id)
+        if label is None:
+            continue
+        wanted = set(normalize_text(row.name).split())
+        reachable = set(normalize_text(f"{label['name']} {label['username']}").split())
+        bucket = per_tier.setdefault(row.tier, {"cases": 0, "unreachable": 0, "examples": []})
+        bucket["cases"] += 1
+        if not wanted & reachable:
+            bucket["unreachable"] += 1
+            if len(bucket["examples"]) < 5:
+                bucket["examples"].append(
+                    {"real_name": row.name, "display_name": label["name"], "username": label["username"]}
+                )
+    for bucket in per_tier.values():
+        bucket["unreachable_share"] = _ratio(bucket["unreachable"], bucket["cases"])
+    total_cases = sum(bucket["cases"] for bucket in per_tier.values())
+    total_unreachable = sum(bucket["unreachable"] for bucket in per_tier.values())
+    return {
+        "overall": {
+            "cases": total_cases,
+            "unreachable": total_unreachable,
+            "unreachable_share": _ratio(total_unreachable, total_cases),
+        },
+        "by_tier": dict(sorted(per_tier.items())),
     }
 
 
@@ -324,7 +420,7 @@ def _latency_metrics(values: list[float]) -> dict[str, float]:
 def _failure_groups(rows: list[EvaluationRow]) -> dict[str, dict[str, int]]:
     failures = [row for row in rows if row.rank != 1]
     grouped: dict[str, dict[str, int]] = {}
-    for field in ("variant", "company", "role", "location", "school"):
+    for field in ("tier", "variant", "company", "role", "location", "school"):
         counts: dict[str, int] = {}
         for row in failures:
             value = str(getattr(row, field) or "(missing)")
@@ -333,6 +429,10 @@ def _failure_groups(rows: list[EvaluationRow]) -> dict[str, dict[str, int]]:
             sorted(counts.items(), key=lambda item: (-item[1], item[0]))
         )
     return grouped
+
+
+def _format_rank(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
 
 
 def _percentile(values: list[float], proportion: float) -> float:
@@ -385,12 +485,48 @@ def _write_csv(path: Path, rows: list[EvaluationRow]) -> None:
 
 def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> None:
     print("\nSearch evaluation summary")
+    overall = summary["overall"]
+    print(
+        f"  {'ALL':18} recall={overall['retrieval_recall']:.1%} "
+        f"top-1={overall['top_1']:.1%} top-10={overall['top_10']:.1%} "
+        f"mean rank={_format_rank(overall['mean_rank_when_found'])}"
+    )
     for variant, metrics in summary["variants"].items():
         print(
             f"  {variant:18} top-1={metrics['top_1']:.1%} "
             f"top-10={metrics['top_10']:.1%} p95={metrics['latency_ms']['p95']:.1f}ms"
         )
-    print(f"  determinism        {summary['determinism']['rate']:.1%}")
+
+    print("\nBy dirt tier")
+    for tier, metrics in summary["tiers"].items():
+        print(
+            f"  {tier:18} n={metrics['count']:<6} recall={metrics['retrieval_recall']:.1%} "
+            f"top-1={metrics['top_1']:.1%} top-10={metrics['top_10']:.1%} "
+            f"mean rank={_format_rank(metrics['mean_rank_when_found'])}"
+        )
+    print("\nBy dirt tier x query variant (recall / top-1 / mean rank)")
+    header = " " * 20 + "".join(f"{variant:>22}" for variant in VARIANT_NAMES)
+    print(header)
+    for tier, variants in summary["tier_variants"].items():
+        cells = "".join(
+            f"{metrics['retrieval_recall']:.2f}/{metrics['top_1']:.2f}/"
+            f"{_format_rank(metrics['mean_rank_when_found']):>5}".rjust(22)
+            for metrics in variants.values()
+        )
+        print(f"  {tier:18}{cells}")
+
+    ceiling = summary["retrieval_ceiling"]
+    print("\nRetrieval ceiling (name shares no token with display name or username)")
+    print(
+        f"  {'overall':18} {ceiling['overall']['unreachable']}/{ceiling['overall']['cases']} "
+        f"= {ceiling['overall']['unreachable_share']:.1%} of cases unreachable at any rank"
+    )
+    for tier, bucket in ceiling["by_tier"].items():
+        print(
+            f"  {tier:18} {bucket['unreachable']}/{bucket['cases']} "
+            f"= {bucket['unreachable_share']:.1%}"
+        )
+    print(f"\n  determinism        {summary['determinism']['rate']:.1%}")
     for concurrency, metrics in summary["http_load"].items():
         print(
             f"  HTTP x{concurrency:<2}          errors={metrics['errors']} "

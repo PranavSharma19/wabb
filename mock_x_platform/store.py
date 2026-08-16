@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from models.direct_message import DirectMessage
 
@@ -60,7 +60,10 @@ class MockXStore:
                     location TEXT NOT NULL,
                     profile_image_url TEXT NOT NULL,
                     verified INTEGER NOT NULL,
-                    receives_your_dm INTEGER NOT NULL
+                    -- NULL means "unknown", which is what X returns when the
+                    -- DM eligibility field is absent from a user object.
+                    receives_your_dm INTEGER,
+                    tier TEXT NOT NULL DEFAULT 'clean'
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS profiles_fts USING fts5(
                     id UNINDEXED,
@@ -82,6 +85,50 @@ class MockXStore:
                 );
                 """
             )
+            self._migrate_profiles(connection)
+
+    @staticmethod
+    def _migrate_profiles(connection: sqlite3.Connection) -> None:
+        """Bring a profiles table written by an older build up to date.
+
+        Databases created before dirt tiers lack `tier` and declare
+        `receives_your_dm` NOT NULL, which SQLite cannot relax in place. Rebuild
+        and copy rather than dropping, so an existing generated dataset survives.
+        """
+
+        columns = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA table_info(profiles)").fetchall()
+        }
+        if not columns:
+            return
+        stale = "tier" not in columns or bool(columns["receives_your_dm"]["notnull"])
+        if not stale:
+            return
+        connection.executescript(
+            """
+            CREATE TABLE profiles_migrated (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                username TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL,
+                location TEXT NOT NULL,
+                profile_image_url TEXT NOT NULL,
+                verified INTEGER NOT NULL,
+                receives_your_dm INTEGER,
+                tier TEXT NOT NULL DEFAULT 'clean'
+            );
+            INSERT INTO profiles_migrated (
+                id, name, username, description, location,
+                profile_image_url, verified, receives_your_dm
+            )
+            SELECT id, name, username, description, location,
+                   profile_image_url, verified, receives_your_dm
+            FROM profiles;
+            DROP TABLE profiles;
+            ALTER TABLE profiles_migrated RENAME TO profiles;
+            """
+        )
 
     def profile_count(self) -> int:
         with self._connection() as connection:
@@ -98,7 +145,8 @@ class MockXStore:
                 str(profile.get("location", "")),
                 str(profile.get("profile_image_url", "")),
                 int(bool(profile.get("verified", False))),
-                int(bool(profile.get("receives_your_dm", False))),
+                _optional_flag(profile.get("receives_your_dm")),
+                str(profile.get("tier", "clean")),
             )
             for profile in profiles
         ]
@@ -109,8 +157,8 @@ class MockXStore:
                 """
                 INSERT INTO profiles (
                     id, name, username, description, location,
-                    profile_image_url, verified, receives_your_dm
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_image_url, verified, receives_your_dm, tier
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -159,6 +207,40 @@ class MockXStore:
                 "SELECT * FROM profiles WHERE id = ?", (str(profile_id),)
             ).fetchone()
         return _profile_row(row) if row is not None else None
+
+    def profile_labels(self, ids: Iterable[str]) -> dict[str, dict[str, str]]:
+        """Return `{id: {tier, name, username}}` for offline evaluation joins.
+
+        Tier is ground truth about how dirty a profile is, so it is deliberately
+        kept out of `_profile_row` and never reaches an API response.
+        """
+
+        wanted = [str(identifier) for identifier in ids]
+        labels: dict[str, dict[str, str]] = {}
+        if not wanted:
+            return labels
+        with self._connection() as connection:
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows = connection.execute(
+                    f"SELECT id, tier, name, username FROM profiles WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    labels[str(row["id"])] = {
+                        "tier": str(row["tier"]),
+                        "name": str(row["name"]),
+                        "username": str(row["username"]),
+                    }
+        return labels
+
+    def tier_counts(self) -> dict[str, int]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT tier, COUNT(*) AS count FROM profiles GROUP BY tier ORDER BY tier"
+            ).fetchall()
+        return {str(row["tier"]): int(row["count"]) for row in rows}
 
     def replace_evaluation_cases(self, cases: list[dict[str, Any]]) -> None:
         with self._connection() as connection:
@@ -319,8 +401,16 @@ def conversation_id_for(first_id: str, second_id: str) -> str:
     return f"mock-dm-{participants[0]}-{participants[1]}"
 
 
+def _optional_flag(value: Any) -> int | None:
+    """Preserve unknown DM eligibility as NULL instead of collapsing it to False."""
+
+    return None if value is None else int(bool(value))
+
+
 def _profile_row(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
+    result.pop("tier", None)
     result["verified"] = bool(result["verified"])
-    result["receives_your_dm"] = bool(result["receives_your_dm"])
+    dm = result.get("receives_your_dm")
+    result["receives_your_dm"] = None if dm is None else bool(dm)
     return result

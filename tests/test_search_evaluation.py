@@ -5,6 +5,7 @@ import json
 
 from models.criteria import RecipientCriteria
 from mock_x_platform.dataset import build_dataset
+from mock_x_platform.dataset import TIER_NAMES
 from mock_x_platform.evaluation import (
     VARIANT_NAMES,
     _percentile,
@@ -63,3 +64,40 @@ def test_small_evaluation_writes_comparable_reports(tmp_path) -> None:
     with csv_path.open(encoding="utf-8", newline="") as source:
         assert len(list(csv.DictReader(source))) == 12
     assert MockXStore(database).profile_count() == 100
+
+
+def test_evaluation_breaks_results_out_by_dirt_tier(tmp_path) -> None:
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=400, seed=42)
+
+    summary, _, csv_path = run_evaluation(
+        database,
+        output_directory=tmp_path / "reports",
+        case_limit=40,
+        determinism_cases=1,
+        run_http=False,
+    )
+
+    assert set(summary["tier_counts"]) == set(TIER_NAMES)
+    assert set(summary["tiers"]) <= set(TIER_NAMES)
+    assert summary["tiers"], "per-tier metrics must not be blank"
+    assert sum(metrics["count"] for metrics in summary["tiers"].values()) == summary["search_count"]
+
+    for tier, metrics in summary["tiers"].items():
+        assert 0.0 <= metrics["retrieval_recall"] <= 1.0
+        assert metrics["mean_rank_when_found"] is None or metrics["mean_rank_when_found"] >= 1.0
+        assert tuple(summary["tier_variants"][tier]) == VARIANT_NAMES
+
+    # The aggregate survives alongside the breakdown.
+    assert summary["overall"]["count"] == summary["search_count"]
+    assert tuple(summary["variants"]) == VARIANT_NAMES
+    assert "tier" in summary["failure_groups"]
+
+    ceiling = summary["retrieval_ceiling"]
+    assert 0.0 <= ceiling["overall"]["unreachable_share"] <= 1.0
+    assert set(ceiling["by_tier"]) <= set(TIER_NAMES)
+
+    with csv_path.open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    # Tier rides on every row so results can be joined back to the corpus.
+    assert all(row["tier"] in TIER_NAMES for row in rows)
