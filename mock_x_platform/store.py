@@ -65,12 +65,16 @@ class MockXStore:
                     receives_your_dm INTEGER,
                     tier TEXT NOT NULL DEFAULT 'clean'
                 );
+                -- Only the columns X's /2/users/search actually matches. Indexing
+                -- the bio and location made document length vary from 3 to 24
+                -- tokens, and bm25 divides by length, so sparse profiles floated
+                -- to the top of the candidate pool and rich ones fell off the end
+                -- of it. Matching X's fields keeps lengths flat and removes that
+                -- bias at the source.
                 CREATE VIRTUAL TABLE IF NOT EXISTS profiles_fts USING fts5(
                     id UNINDEXED,
                     name,
                     username,
-                    description,
-                    location,
                     tokenize = 'unicode61 remove_diacritics 2'
                 );
                 CREATE TABLE IF NOT EXISTS evaluation_cases (
@@ -86,6 +90,7 @@ class MockXStore:
                 """
             )
             self._migrate_profiles(connection)
+            self._migrate_search_index(connection)
 
     @staticmethod
     def _migrate_profiles(connection: sqlite3.Connection) -> None:
@@ -130,6 +135,30 @@ class MockXStore:
             """
         )
 
+    @staticmethod
+    def _migrate_search_index(connection: sqlite3.Connection) -> None:
+        """Rebuild a search index that still covers description and location."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(profiles_fts)").fetchall()
+        }
+        if not columns or columns == {"id", "name", "username"}:
+            return
+        connection.executescript(
+            """
+            DROP TABLE profiles_fts;
+            CREATE VIRTUAL TABLE profiles_fts USING fts5(
+                id UNINDEXED,
+                name,
+                username,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
+            INSERT INTO profiles_fts (id, name, username)
+                SELECT id, name, username FROM profiles;
+            """
+        )
+
     def profile_count(self) -> int:
         with self._connection() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM profiles").fetchone()
@@ -163,14 +192,19 @@ class MockXStore:
                 rows,
             )
             connection.executemany(
-                """
-                INSERT INTO profiles_fts (id, name, username, description, location)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [row[:5] for row in rows],
+                "INSERT INTO profiles_fts (id, name, username) VALUES (?, ?, ?)",
+                [row[:3] for row in rows],
             )
 
     def search_profiles(self, query: str, *, limit: int = 250) -> list[dict[str, Any]]:
+        """Pool candidates, preferring full-query matches over partial ones.
+
+        Matching every token is a ranking preference, not an admission test: the
+        AND rows lead, then the OR rows that AND did not already return. Gating
+        the OR pass on "did AND return fewer than ten" made a profile sharing one
+        of two name tokens invisible whenever ten other people matched both.
+        """
+
         tokens = [token for token in query.split() if token]
         if not tokens:
             return []
@@ -178,7 +212,7 @@ class MockXStore:
         bounded_limit = min(max(int(limit), 1), 1000)
         with self._connection() as connection:
             rows = self._fts_rows(connection, " AND ".join(quoted), bounded_limit)
-            if len(rows) < min(10, bounded_limit) and len(quoted) > 1:
+            if len(quoted) > 1 and len(rows) < bounded_limit:
                 fallback = self._fts_rows(connection, " OR ".join(quoted), bounded_limit)
                 seen = {str(row["id"]) for row in rows}
                 rows.extend(row for row in fallback if str(row["id"]) not in seen)
@@ -189,13 +223,14 @@ class MockXStore:
     def _fts_rows(
         connection: sqlite3.Connection, query: str, limit: int
     ) -> list[sqlite3.Row]:
+        # id breaks bm25 ties so the pool is byte-identical between runs.
         return connection.execute(
             """
             SELECT p.*
             FROM profiles_fts
             JOIN profiles AS p ON p.id = profiles_fts.id
             WHERE profiles_fts MATCH ?
-            ORDER BY bm25(profiles_fts)
+            ORDER BY bm25(profiles_fts), p.id
             LIMIT ?
             """,
             (query, limit),

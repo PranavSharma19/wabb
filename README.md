@@ -144,7 +144,9 @@ python -m mock_x_platform.dataset
 
 Restart `python -m mock_x_platform` afterward. The generator uses a fixed seed and includes the original ambiguous John Doe profiles plus broad synthetic variation across names, companies, roles, schools, locations, verification, and DM eligibility. It also stores 1,000 deterministic ground-truth cases pairing natural-language descriptions and structured criteria with the expected profile ID. Re-running the command replaces the generated profiles and evaluation cases while preserving fake messages.
 
-Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index. Each search first retrieves at most 250 plausible profiles, applies deterministic mock relevance, and returns at most 10 for the application's detailed criteria ranker. This avoids scanning and sorting all 100,000 profiles per request.
+Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index over name and username, the two fields X's `/2/users/search` actually matches. Each search first retrieves at most 250 plausible profiles, applies deterministic mock relevance, and returns at most 10 for the application's detailed criteria ranker. This avoids scanning and sorting all 100,000 profiles per request.
+
+Profiles matching every query token lead the pool, followed by profiles matching any token; the full-query match is a ranking preference, not a filter. Indexing the bio and location was removed deliberately: document lengths then ranged from 3 to 24 tokens, and because bm25 divides by document length, sparse profiles floated to the top of the 250-row pool while rich profiles fell off the end of it — retrieval was being filtered by how complete a profile was.
 
 For a smaller local dataset or another repeatable variation:
 
@@ -170,7 +172,16 @@ For a quick development sample:
 python -m mock_x_platform.evaluation --limit 25 --http-requests 10 --report-only
 ```
 
-Timestamped JSON summaries and row-level CSV details are written to `.cache/evaluation/`. Reports include the database SHA-256 fingerprint and generator metadata, top-1/top-3/top-10 accuracy, mean reciprocal rank, retrieval recall, ranking success, latency percentiles, HTTP throughput/errors, acceptance checks, and concrete failure examples. Use `--skip-http` to isolate in-process search quality or `--report-only` when collecting a baseline that should not return an error status after a failed threshold.
+Timestamped JSON summaries and row-level CSV details are written to `.cache/evaluation/`. Reports include the database SHA-256 fingerprint and generator metadata, top-1/top-3/top-10 accuracy, mean reciprocal rank, retrieval recall, ranking success, latency percentiles, HTTP throughput/errors, acceptance checks, and concrete failure examples. Results are also broken out per dirt tier and per tier × query variant, because a blended number says only that something got worse. Use `--skip-http` to isolate in-process search quality or `--report-only` when collecting a baseline that should not return an error status after a failed threshold.
+
+#### What these numbers do and do not mean
+
+**Retrieval recall here measures presence in a 250-row candidate pool that production never sees.** The real `/2/users/search` returns at most 10 users, already ranked by X. In production, retrieval recall and top-10 nearly coincide, and our ranker only reorders ten rows it did not select. The harness therefore measures the ranker sifting a candidate pool far larger and differently ordered than the one the device will get, so **the headline top-1 figures do not transfer to the device and must not be quoted as product metrics.** Treat them as a regression signal for the ranker and pooling logic, not as a prediction of what a user experiences.
+
+Two findings are unaffected by this caveat, because neither depends on pool size:
+
+- **The scoring ceiling.** Company, role and school are scored from the bio and location from the location field, so a profile with neither can earn at most 40 (name) + 5 (can-DM) = 45 — structurally unable to outrank a wrong person with a rich bio, no matter how correct it is. Measured across every partial-tier case, the right person scores 40 or 45 and never more.
+- **Structural unreachability.** When someone's display name and username share no token with their real name, a name-primary query cannot reach them at any rank. That fraction is reported as `retrieval_ceiling` and is a product limit, not a bug to tune away.
 
 ## Offline voice input
 
