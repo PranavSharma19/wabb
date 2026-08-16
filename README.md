@@ -148,6 +148,15 @@ Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5
 
 Profiles matching every query token lead the pool, followed by profiles matching any token; the full-query match is a ranking preference, not a filter. Indexing the bio and location was removed deliberately: document lengths then ranged from 3 to 24 tokens, and because bm25 divides by document length, sparse profiles floated to the top of the 250-row pool while rich profiles fell off the end of it — retrieval was being filtered by how complete a profile was.
 
+#### How retrieval behaves as the corpus grows
+
+Measured at 5k / 20k / 40k / 100k profiles, seed 42, full case set:
+
+- **Well-formed names hold flat.** Retrieval recall stays at 1.000 for the clean, partial and decorated tiers at every size, and the profile-richness ordering that the narrowed index removed does not come back — clean and partial track each other within one point at 100k.
+- **Near-miss names decay, by construction.** A typo'd first name leaves one usable token, so every profile sharing that surname scores *identically* under bm25: at 100k the median tie group is 1,716 profiles competing for 250 slots. Measured recall tracks `250 / tie-group size` to within a point at every size (1.000 → 0.778 → 0.392 → 0.144). No ordering rule can prefer the right person here, because within an exact tie there is no signal to prefer them by. A pool large enough to fix it would have to grow linearly with the corpus forever, which is the same as having no pool.
+- **Name-space saturation dominates at 100k.** The generator draws from 41 first names and 43 surnames, so a corpus of N profiles puts roughly `N/1763` people behind every exact name while the mock returns ten. Top-1 is therefore capped near `10/(N/1763)`: about 1.00 at 5k, 0.88 at 20k, 0.44 at 40k, 0.18 at 100k. Measured clean-corpus top-1 is 0.836 at 20k and 0.175 at 100k, matching the model. **At the 100k default the evaluation largely measures name collisions rather than search quality.** Widening the name pool is the fix; nothing about retrieval or ranking needs to change for it.
+- **`--limit` samples are optimistic.** `--limit N` takes the N lowest case ids, profile ids run in generation order, and that is also how bm25 ties break — so limited runs systematically favour the cases they sample. The same 100k database reports clean-corpus top-1 of 1.000 at `--limit 200` and 0.175 across all 1,000 cases. Calibrate nothing from a limited run.
+
 For a smaller local dataset or another repeatable variation:
 
 ```powershell
@@ -182,6 +191,14 @@ Two findings are unaffected by this caveat, because neither depends on pool size
 
 - **The scoring ceiling.** Company, role and school are scored from the bio and location from the location field, so a profile with neither can earn at most 40 (name) + 5 (can-DM) = 45 — structurally unable to outrank a wrong person with a rich bio, no matter how correct it is. Measured across every partial-tier case, the right person scores 40 or 45 and never more.
 - **Structural unreachability.** When someone's display name and username share no token with their real name, a name-primary query cannot reach them at any rank. That fraction is reported as `retrieval_ceiling` and is a product limit, not a bug to tune away.
+
+#### The acceptance gate
+
+Thresholds live in `CORPUS_THRESHOLDS` and are **calibrated for the documented default run**: 100,000 profiles, the full 1,000-case set, verified on seeds 42 and 43. Each threshold is the lower of the two seeds minus 0.04, which is 2.5× the largest movement observed between seeds, so corpus noise cannot trip the gate while a regression of more than about four points does.
+
+Clean and dirty corpora get separate threshold sets, selected automatically from the profile tiers in the database. They measure different things: on a clean corpus every profile carries the bio and location the ranker scores, so a shortfall is a defect; on a dirty corpus most of the shortfall is the corpus. Runs on a smaller corpus, or with `--limit`, clear the thresholds easily — that is the name space desaturating and the sample favouring low ids, not the search improving. The report says so explicitly when a run does not match the calibration.
+
+Every check records, in `catches`, the specific regression it exists to detect; the printed summary shows it for any check that fails. Checks that could not be tied to a regression were removed rather than left as decoration — the four extra top-10 checks were provably identical to `clean top-10` in every run, because all five well-formed variants build the same query and are handed the same ten rows. In their place the gate now checks that the formatting variant scores *identically* to clean (which is what actually verifies sanitization), gates the worst of the three missing-clue variants, and checks `handle_name` retrieval recall on its own. That last one earns its place: reverting the AND-as-preference change moves handle-tier recall from 0.225 to 0.005 while aggregate recall only slips from 0.933 to 0.909 and clears its own threshold, so the aggregate alone would let that regression through.
 
 ## Offline voice input
 
