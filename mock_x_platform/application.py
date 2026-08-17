@@ -90,6 +90,10 @@ class MockXApplication:
             else MOCK_PROFILES
         )
         profiles = sorted(source, key=relevance)[:limit]
+        # Billed here rather than in the store: the store hands back a 250-row
+        # candidate pool, and X charges for the resources the API returns.
+        self.store.ledger.record_search()
+        self.store.ledger.record_profiles(str(profile["id"]) for profile in profiles)
         result = {
             "data": profiles,
             "meta": {"result_count": len(profiles), "mock": True},
@@ -123,6 +127,8 @@ class MockXApplication:
             )
         if profile is None:
             raise MockXHttpError(404, f"User @{handle} was not found.", "User not found")
+        self.store.ledger.record_lookup()
+        self.store.ledger.record_profiles([str(profile["id"])])
         return {"data": profile}
 
     def send_message(self, participant_id: str, text: str) -> dict[str, Any]:
@@ -144,6 +150,7 @@ class MockXApplication:
             recipient_id=str(participant_id),
             text=cleaned,
         )
+        self.store.ledger.record_dm_send()
         return {"data": message.to_dict()}
 
     def list_messages(self, participant_id: str) -> dict[str, Any]:

@@ -96,3 +96,28 @@ def test_handle_lookup_reports_a_missing_account_as_missing(
         app.lookup_user_by_username("nobodyhome")
 
     assert error.value.status == 404
+
+
+def test_a_search_bills_only_the_profiles_it_returns(app: MockXApplication) -> None:
+    app.search_users("John Doe", max_results=5)
+
+    # Not the 250-row candidate pool behind it: X charges for resources returned.
+    assert app.store.ledger.distinct_profiles == 5
+    assert app.store.ledger.searches == 1
+
+
+def test_repeating_a_search_inside_the_window_costs_nothing_more(
+    app: MockXApplication,
+) -> None:
+    app.search_users("John Doe", max_results=5)
+    app.search_users("John Doe", max_results=5)
+
+    assert app.store.ledger.searches == 2
+    assert app.store.ledger.distinct_profiles == 5
+
+
+def test_a_lookup_bills_one_profile(app: MockXApplication) -> None:
+    app.lookup_user_by_username("johndoe_xyz")
+
+    assert app.store.ledger.lookups == 1
+    assert app.store.ledger.distinct_profiles == 1
