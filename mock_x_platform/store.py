@@ -8,12 +8,43 @@ from typing import Any, Iterable, Iterator
 
 from models.direct_message import DirectMessage
 
+from .pricing import BillingLedger
+
+MATCH_SCOPES = ("name_username", "name_username_bio")
+RESULT_ORDERS = ("bm25", "follower_weighted")
+
+# Which FTS table serves each scope. Two tables rather than extra columns on one:
+# fts5's bm25 divides by whole-row token length, so folding the bio into the
+# default index would re-introduce the length bias round 4 removed, for the
+# name_username scope as well as the new one.
+_FTS_TABLES = {
+    "name_username": "profiles_fts",
+    "name_username_bio": "profiles_fts_bio",
+}
+
 
 class MockXStore:
     """SQLite persistence for fake DMs and deterministic failure rules."""
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        match_scope: str = "name_username",
+        result_order: str = "bm25",
+        ledger: BillingLedger | None = None,
+    ):
+        if match_scope not in MATCH_SCOPES:
+            raise ValueError(f"match_scope must be one of: {', '.join(MATCH_SCOPES)}")
+        if result_order not in RESULT_ORDERS:
+            raise ValueError(f"result_order must be one of: {', '.join(RESULT_ORDERS)}")
         self.path = Path(path)
+        self.match_scope = match_scope
+        self.result_order = result_order
+        # Owned here so every MockXApplication over the same store shares one
+        # bill, and so an in-process evaluation can read it without going
+        # anywhere near the HTTP layer.
+        self.ledger = ledger or BillingLedger()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -63,7 +94,8 @@ class MockXStore:
                     -- NULL means "unknown", which is what X returns when the
                     -- DM eligibility field is absent from a user object.
                     receives_your_dm INTEGER,
-                    tier TEXT NOT NULL DEFAULT 'clean'
+                    tier TEXT NOT NULL DEFAULT 'clean',
+                    follower_count INTEGER NOT NULL DEFAULT 0
                 );
                 -- Only the columns X's /2/users/search actually matches. Indexing
                 -- the bio and location made document length vary from 3 to 24
@@ -75,6 +107,16 @@ class MockXStore:
                     id UNINDEXED,
                     name,
                     username,
+                    tokenize = 'unicode61 remove_diacritics 2'
+                );
+                -- Used only when match_scope is 'name_username_bio', to model
+                -- the possibility that X's query matches bios too (Unknown A).
+                CREATE VIRTUAL TABLE IF NOT EXISTS profiles_fts_bio USING fts5(
+                    id UNINDEXED,
+                    name,
+                    username,
+                    description,
+                    location,
                     tokenize = 'unicode61 remove_diacritics 2'
                 );
                 CREATE TABLE IF NOT EXISTS evaluation_cases (
@@ -91,6 +133,8 @@ class MockXStore:
             )
             self._migrate_profiles(connection)
             self._migrate_search_index(connection)
+            self._migrate_follower_count(connection)
+            self._migrate_bio_index(connection)
 
     @staticmethod
     def _migrate_profiles(connection: sqlite3.Connection) -> None:
@@ -159,6 +203,41 @@ class MockXStore:
             """
         )
 
+    @staticmethod
+    def _migrate_follower_count(connection: sqlite3.Connection) -> None:
+        """Add the follower column to a database generated before it existed."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(profiles)").fetchall()
+        }
+        if not columns or "follower_count" in columns:
+            return
+        connection.execute(
+            "ALTER TABLE profiles ADD COLUMN follower_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    @staticmethod
+    def _migrate_bio_index(connection: sqlite3.Connection) -> None:
+        """Fill the bio index for a database generated before it existed.
+
+        Without this, switching match_scope on an existing 100k corpus silently
+        returns nothing rather than obviously failing.
+        """
+
+        profiles = connection.execute("SELECT COUNT(*) AS count FROM profiles").fetchone()
+        indexed = connection.execute(
+            "SELECT COUNT(*) AS count FROM profiles_fts_bio"
+        ).fetchone()
+        if not int(profiles["count"]) or int(indexed["count"]):
+            return
+        connection.execute(
+            """
+            INSERT INTO profiles_fts_bio (id, name, username, description, location)
+            SELECT id, name, username, description, location FROM profiles
+            """
+        )
+
     def profile_count(self) -> int:
         with self._connection() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM profiles").fetchone()
@@ -176,24 +255,34 @@ class MockXStore:
                 int(bool(profile.get("verified", False))),
                 _optional_flag(profile.get("receives_your_dm")),
                 str(profile.get("tier", "clean")),
+                int(profile.get("follower_count", 0) or 0),
             )
             for profile in profiles
         ]
         with self._connection() as connection:
             connection.execute("DELETE FROM profiles")
             connection.execute("DELETE FROM profiles_fts")
+            connection.execute("DELETE FROM profiles_fts_bio")
             connection.executemany(
                 """
                 INSERT INTO profiles (
                     id, name, username, description, location,
-                    profile_image_url, verified, receives_your_dm, tier
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_image_url, verified, receives_your_dm, tier,
+                    follower_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
             connection.executemany(
                 "INSERT INTO profiles_fts (id, name, username) VALUES (?, ?, ?)",
                 [row[:3] for row in rows],
+            )
+            connection.executemany(
+                """
+                INSERT INTO profiles_fts_bio (id, name, username, description, location)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [row[:5] for row in rows],
             )
 
     def search_profiles(self, query: str, *, limit: int = 250) -> list[dict[str, Any]]:
@@ -219,18 +308,25 @@ class MockXStore:
                 rows = rows[:bounded_limit]
         return [_profile_row(row) for row in rows]
 
-    @staticmethod
     def _fts_rows(
-        connection: sqlite3.Connection, query: str, limit: int
+        self, connection: sqlite3.Connection, query: str, limit: int
     ) -> list[sqlite3.Row]:
-        # id breaks bm25 ties so the pool is byte-identical between runs.
+        # Table and ordering are chosen from validated constants, never from
+        # caller input, which is what makes the interpolation below safe.
+        table = _FTS_TABLES[self.match_scope]
+        # id breaks ties so the pool is byte-identical between runs.
+        order = (
+            f"bm25({table}), p.id"
+            if self.result_order == "bm25"
+            else "p.follower_count DESC, p.id"
+        )
         return connection.execute(
-            """
+            f"""
             SELECT p.*
-            FROM profiles_fts
-            JOIN profiles AS p ON p.id = profiles_fts.id
-            WHERE profiles_fts MATCH ?
-            ORDER BY bm25(profiles_fts), p.id
+            FROM {table}
+            JOIN profiles AS p ON p.id = {table}.id
+            WHERE {table} MATCH ?
+            ORDER BY {order}
             LIMIT ?
             """,
             (query, limit),

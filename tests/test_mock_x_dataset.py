@@ -40,11 +40,11 @@ def test_generated_database_is_counted_and_searchable(tmp_path) -> None:
     assert store.profile_count() == 1_000
     assert store.evaluation_case_count() == 988
     assert store.evaluation_cases(limit=1)[0]["expected_profile_id"] == "2000001"
-    # generator_version moved to 2 and tier_mix joined the metadata when dirt
-    # tiers were added: the profile shape changed, so reports from older
-    # datasets are not comparable to these and must be distinguishable.
+    # generator_version moved to 3 when follower_count joined the profile shape
+    # (it was 2 when dirt tiers were added): reports from older datasets are not
+    # comparable to these and must be distinguishable.
     assert store.dataset_metadata() == {
-        "generator_version": "2",
+        "generator_version": "3",
         "profile_count": "1000",
         "seed": "42",
         "tier_mix": json.dumps(DEFAULT_TIER_MIX, sort_keys=True),
@@ -199,3 +199,32 @@ def test_old_databases_are_migrated_instead_of_dropped(tmp_path) -> None:
     assert store.tier_counts() == {"clean": 1}
     store.replace_profiles([{"id": "2", "name": "New", "username": "new", "receives_your_dm": None}])
     assert store.get_profile("2")["receives_your_dm"] is None
+
+
+def test_generated_profiles_carry_a_heavy_tailed_follower_count() -> None:
+    from mock_x_platform.dataset import generate_profiles
+
+    counts = [
+        int(profile["follower_count"])
+        for profile in generate_profiles(600, seed=42)
+    ]
+
+    assert all(count > 0 for count in counts)
+    # Heavy-tailed, not normal: the top of the distribution is orders of
+    # magnitude above the median, which is the shape Unknown B turns on.
+    ordered = sorted(counts)
+    assert ordered[-1] > 20 * ordered[len(ordered) // 2]
+
+
+def test_adding_follower_counts_did_not_disturb_the_existing_streams() -> None:
+    from mock_x_platform.dataset import generate_profiles
+
+    profiles = list(generate_profiles(300, seed=42))
+    names = [profile["name"] for profile in profiles]
+    tiers = [profile["tier"] for profile in profiles]
+
+    # Follower counts come from a third RNG stream precisely so identities and
+    # dirt stay byte-identical to every corpus measured in earlier rounds.
+    again = list(generate_profiles(300, seed=42))
+    assert [profile["name"] for profile in again] == names
+    assert [profile["tier"] for profile in again] == tiers
