@@ -23,6 +23,7 @@ class WorkflowRunner(Protocol):
     def stop_voice(self) -> None: ...
     def cancel_current(self) -> None: ...
     def start_search(self, criteria: RecipientCriteria) -> int: ...
+    def start_handle_lookup(self, handle: str) -> int: ...
     def start_message(self, recipient_id: str, text: str) -> int: ...
     def poll(self) -> list[WorkerEvent]: ...
     def shutdown(self) -> None: ...
@@ -87,6 +88,13 @@ class ThreadedWorkflowRunner:
         self._current_operation_id = operation_id
         criteria_copy = RecipientCriteria.from_dict(criteria.to_dict())
         self._executor.submit(self._run_search, operation_id, criteria_copy)
+        return operation_id
+
+    def start_handle_lookup(self, handle: str) -> int:
+        self.cancel_current()
+        operation_id = next(self._ids)
+        self._current_operation_id = operation_id
+        self._executor.submit(self._run_handle_lookup, operation_id, str(handle))
         return operation_id
 
     def start_message(self, recipient_id: str, text: str) -> int:
@@ -163,6 +171,22 @@ class ThreadedWorkflowRunner:
             return
         self._events.put(
             WorkerEvent(operation_id, WorkerEventType.SEARCH_COMPLETE, result, "search")
+        )
+
+    def _run_handle_lookup(self, operation_id: int, handle: str) -> None:
+        try:
+            result = self.search_provider.lookup(handle)
+        except Exception as exc:
+            self._events.put(
+                WorkerEvent(operation_id, WorkerEventType.FAILED, str(exc), "handle_lookup")
+            )
+            return
+        # Reuses SEARCH_COMPLETE: a lookup is a search result of length zero or
+        # one, and the profile screen already knows how to show one candidate.
+        self._events.put(
+            WorkerEvent(
+                operation_id, WorkerEventType.SEARCH_COMPLETE, result, "handle_lookup"
+            )
         )
 
     def _run_message(self, operation_id: int, recipient_id: str, text: str) -> None:

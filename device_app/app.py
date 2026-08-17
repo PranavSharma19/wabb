@@ -83,10 +83,11 @@ def _configured_search_provider(settings: Settings) -> SearchProvider:
     if mode == "existing":
         # Import only when explicitly selected. Mock device development never
         # initializes or calls the real search implementation.
-        from search.service import find_users
+        from search.service import find_users, lookup_user
 
         return ExistingSearchAdapter(
-            lambda criteria: find_users(criteria, settings=settings)
+            lambda criteria: find_users(criteria, settings=settings),
+            lambda handle: lookup_user(handle, settings=settings),
         )
     raise ValueError("DEVICE_SEARCH_PROVIDER must be 'mock' or 'existing'.")
 
