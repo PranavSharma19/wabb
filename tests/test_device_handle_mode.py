@@ -11,10 +11,9 @@ from tests.test_device_state import FakeRunner
 
 
 class HandleRunner(FakeRunner):
-    def __init__(self, result: SearchResult | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.lookup_calls: list[str] = []
-        self.result = result
 
     def start_handle_lookup(self, handle: str) -> int:
         operation_id = self.next_id
@@ -118,8 +117,44 @@ def test_the_profile_screen_can_switch_to_the_handle_as_a_recovery_path() -> Non
     runner = HandleRunner()
     controller = DeviceController(runner)
     controller.context.criteria = RecipientCriteria(name="Joe Bart")
+    controller.context.candidates = [
+        ProfileCandidate(id="7", name="Joe Bart", username="joebart7", profile_url="https://x.com/joebart7")
+    ]
     controller.state = AppState.SELECT_PROFILE
 
     controller.dispatch(Action.HANDLE_MODE)
-
     assert controller.state is AppState.HANDLE_RECORDING
+
+    # Backing out of the recovery path must return the user to the candidate
+    # list they came from, with the search they already paid for intact --
+    # not to HOME, which discards the whole session.
+    controller.dispatch(Action.BACK)
+    assert controller.state is AppState.SELECT_PROFILE
+    assert controller.context.criteria.name == "Joe Bart"
+    assert [candidate.username for candidate in controller.context.candidates] == ["joebart7"]
+
+
+def test_a_not_found_handle_returns_to_the_candidate_list_it_came_from() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+    controller.context.criteria = RecipientCriteria(name="Joe Bart")
+    controller.state = AppState.SELECT_PROFILE
+
+    controller.dispatch(Action.HANDLE_MODE)
+    speak(controller, runner, "at nobodyhome")
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    runner.emit(
+        WorkerEvent(
+            operation_id,
+            WorkerEventType.SEARCH_COMPLETE,
+            SearchResult(query="@nobodyhome", candidates=()),
+            "handle_lookup",
+        )
+    )
+    controller.update()
+    assert controller.state is AppState.HANDLE_NOT_FOUND
+
+    controller.dispatch(Action.BACK)
+    assert controller.state is AppState.SELECT_PROFILE
+    assert controller.context.criteria.name == "Joe Bart"

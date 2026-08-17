@@ -64,6 +64,7 @@ class SessionContext:
     recording_started_at: float | None = None
     recording_remaining: int = 0
     refinement_origin: AppState = AppState.RECIPIENT_REVIEW
+    handle_origin: AppState = AppState.HOME
     recoverable_error: str = ""
     error_operation: str = ""
     error_back_state: AppState = AppState.HOME
@@ -149,6 +150,7 @@ class DeviceController:
             self.context = SessionContext(
                 recording_remaining=int(self.record_limit_seconds)
             )
+            self.context.handle_origin = AppState.HOME
             self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
 
     def _handle_recipient_recording(self, action: Action) -> None:
@@ -165,7 +167,7 @@ class DeviceController:
             "recipient_refinement": self.context.refinement_origin,
             "message_voice": AppState.RECORD_MESSAGE,
             "message_refinement": AppState.REVIEW_MESSAGE,
-            "handle_voice": AppState.HOME,
+            "handle_voice": self.context.handle_origin,
         }
         self._cancel_to(targets.get(self.context.current_operation, AppState.HOME))
 
@@ -204,11 +206,11 @@ class DeviceController:
         if action is Action.SEND_UP:
             self._finish_recording()
         elif action in {Action.REFINE, Action.BACK}:
-            self._cancel_to(AppState.HOME)
+            self._cancel_to(self.context.handle_origin)
 
     def _handle_handle_lookup(self, action: Action) -> None:
         if action in {Action.REFINE, Action.BACK}:
-            self._cancel_to(AppState.HOME)
+            self._cancel_to(self.context.handle_origin)
 
     def _handle_handle_not_found(self, action: Action) -> None:
         # Both ways forward are offered explicitly. Picking one silently is what
@@ -217,9 +219,10 @@ class DeviceController:
         if action is Action.SEND_DOWN:
             self._start_voice("initial_voice", AppState.RECORD_RECIPIENT)
         elif action is Action.HANDLE_MODE:
+            # A retry keeps the original origin -- leave handle_origin untouched.
             self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
         elif action is Action.BACK:
-            self._cancel_to(AppState.HOME)
+            self._cancel_to(self.context.handle_origin)
 
     def _handle_profiles(self, action: Action) -> None:
         count = len(self.context.candidates)
@@ -240,6 +243,7 @@ class DeviceController:
             # The recovery path: the candidate list is not the person, and the
             # user turns out to know the handle after all. The criteria are kept
             # so BACK still returns to a populated review screen.
+            self.context.handle_origin = AppState.SELECT_PROFILE
             self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
         elif action is Action.SEND_DOWN and self.current_candidate is not None:
             self.context.selected_candidate = self.current_candidate
@@ -439,7 +443,7 @@ class DeviceController:
         self.context.message_scroll = 0
         self.state = AppState.REVIEW_MESSAGE
 
-    def _handle_search_complete(self, payload: Any, operation: str = "search") -> None:
+    def _handle_search_complete(self, payload: Any, operation: str) -> None:
         if isinstance(payload, SearchResult):
             self.context.search_query = payload.query
             self.context.candidates = list(payload.candidates)
@@ -466,8 +470,8 @@ class DeviceController:
             "message_voice": AppState.RECORD_MESSAGE,
             "message_refinement": AppState.REVIEW_MESSAGE,
             "send_message": AppState.REVIEW_MESSAGE,
-            "handle_voice": AppState.HOME,
-            "handle_lookup": AppState.HOME,
+            "handle_voice": self.context.handle_origin,
+            "handle_lookup": self.context.handle_origin,
         }
         self.context.error_back_state = back_states.get(event.operation, AppState.HOME)
         self._clear_operation()
