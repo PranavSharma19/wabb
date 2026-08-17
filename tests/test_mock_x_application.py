@@ -101,7 +101,9 @@ def test_handle_lookup_reports_a_missing_account_as_missing(
 def test_a_search_bills_only_the_profiles_it_returns(app: MockXApplication) -> None:
     app.search_users("John Doe", max_results=5)
 
-    # Not the 250-row candidate pool behind it: X charges for resources returned.
+    # The fixture uses a mock store, which falls back to the twelve hand-written
+    # MOCK_PROFILES fixtures. This test verifies the page size (5) is billed, not
+    # the full fixture set.
     assert app.store.ledger.distinct_profiles == 5
     assert app.store.ledger.searches == 1
 
@@ -121,3 +123,26 @@ def test_a_lookup_bills_one_profile(app: MockXApplication) -> None:
 
     assert app.store.ledger.lookups == 1
     assert app.store.ledger.distinct_profiles == 1
+
+
+def test_a_search_bills_the_page_not_the_pool_behind_it(tmp_path) -> None:
+    # The other billing tests run against an empty store, which falls back to the
+    # twelve hand-written fixtures -- so none of them actually exercises the
+    # 250-row candidate pool. This one does. Recording the pool instead of the
+    # page would inflate every cost figure in the project about twenty-five fold,
+    # and would do it silently.
+    from mock_x_platform.dataset import build_dataset
+
+    database = tmp_path / "corpus.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+    store = MockXStore(database)
+    app = MockXApplication(store)
+
+    pooled = len(store.search_profiles("Sam Lee"))
+    store.ledger.reset()
+
+    returned = app.search_users("Sam Lee", max_results=5)["data"]
+
+    assert len(returned) == 5
+    assert pooled > 20, "fixture too small to distinguish page from pool"
+    assert store.ledger.distinct_profiles == 5
