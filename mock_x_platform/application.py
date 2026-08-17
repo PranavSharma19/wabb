@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from typing import Any
 
@@ -43,6 +45,40 @@ class MockXHttpError(RuntimeError):
         }
 
 
+# X's real bounds. The default of 100 is deliberate: a caller that omits
+# max_results should reproduce the $1.00-per-search mistake here, in a harness
+# that reports it, rather than in production.
+DEFAULT_MAX_RESULTS = 100
+MAX_MAX_RESULTS = 1000
+
+
+def encode_cursor(query: str, offset: int) -> str:
+    """An opaque (query, offset) cursor, so callers cannot page by arithmetic."""
+
+    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+    raw = f"{digest}:{int(offset)}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(token: str, query: str) -> int:
+    """Read an offset back, refusing a cursor minted for a different query."""
+
+    padded = str(token) + "=" * (-len(str(token)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        digest, _, raw_offset = decoded.partition(":")
+        offset = int(raw_offset)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise MockXHttpError(
+            400, "next_token is not a valid pagination token", "Invalid next_token"
+        ) from exc
+    if offset < 0 or digest != hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]:
+        raise MockXHttpError(
+            400, "next_token does not belong to this query", "Invalid next_token"
+        )
+    return offset
+
+
 class MockXApplication:
     """Transport-independent X-like behavior used by the local HTTP server."""
 
@@ -53,12 +89,20 @@ class MockXApplication:
     def health(self) -> dict[str, Any]:
         return {"status": "ok", "service": "mock-x-platform", "owner_id": self.owner_id}
 
-    def search_users(self, query: str, max_results: int = 10) -> dict[str, Any]:
-        result, _ = self.search_users_with_diagnostics(query, max_results)
+    def search_users(
+        self,
+        query: str,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        next_token: str | None = None,
+    ) -> dict[str, Any]:
+        result, _ = self.search_users_with_diagnostics(query, max_results, next_token)
         return result
 
     def search_users_with_diagnostics(
-        self, query: str, max_results: int = 10
+        self,
+        query: str,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        next_token: str | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
         """Run the real search path and expose preliminary IDs for offline evaluation."""
 
@@ -69,7 +113,8 @@ class MockXApplication:
                 "query must match [A-Za-z0-9_' ] and contain 1 to 50 characters",
                 "Invalid query",
             )
-        limit = min(max(int(max_results), 1), 10)
+        limit = min(max(int(max_results), 1), MAX_MAX_RESULTS)
+        offset = decode_cursor(next_token, query) if next_token else 0
         query_tokens = set(normalize_text(query).split())
 
         def relevance(profile: dict[str, object]) -> tuple[int, str]:
@@ -84,21 +129,25 @@ class MockXApplication:
             overlap = sum(token in searchable_tokens for token in query_tokens)
             return (-overlap, str(profile["id"]))
 
+        # The pool has to reach at least as deep as the page being served. The
+        # floor of 250 keeps the first page byte-identical to round 4's.
+        pool_limit = min(1000, max(250, offset + limit))
         source = (
-            self.store.search_profiles(query, limit=250)
+            self.store.search_profiles(query, limit=pool_limit)
             if self.store.profile_count()
             else MOCK_PROFILES
         )
-        profiles = sorted(source, key=relevance)[:limit]
-        # Billed here rather than in the store: the store hands back a 250-row
-        # candidate pool, and X charges for the resources the API returns.
+        ordered = sorted(source, key=relevance)
+        profiles = ordered[offset : offset + limit]
+        # Billed here rather than in the store: the store hands back a candidate
+        # pool, and X charges for the resources the API returns.
         self.store.ledger.record_search()
         self.store.ledger.record_profiles(str(profile["id"]) for profile in profiles)
-        result = {
-            "data": profiles,
-            "meta": {"result_count": len(profiles), "mock": True},
-        }
-        return result, [str(profile["id"]) for profile in source]
+        meta: dict[str, Any] = {"result_count": len(profiles), "mock": True}
+        if offset + limit < len(ordered):
+            meta["next_token"] = encode_cursor(query, offset + limit)
+        result = {"data": profiles, "meta": meta}
+        return result, [str(profile["id"]) for profile in ordered]
 
     def lookup_user_by_username(self, username: str) -> dict[str, Any]:
         """Resolve one profile by handle -- X's /2/users/by/username/:username.

@@ -31,17 +31,37 @@ class MockXPlatformClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
 
-    def search_users(self, query: str, max_results: int = 10) -> list[Candidate]:
-        limit = min(max(int(max_results), 1), 10)
-        payload = self._request(
-            "GET",
-            "/2/users/search",
-            params={"query": query, "max_results": limit},
+    def search_users(
+        self, query: str, max_results: int = 100, next_token: str | None = None
+    ) -> list[Candidate]:
+        candidates, _ = self.search_users_page(
+            query, max_results=max_results, next_token=next_token
         )
+        return candidates
+
+    def search_users_page(
+        self,
+        query: str,
+        *,
+        max_results: int = 100,
+        next_token: str | None = None,
+    ) -> tuple[list[Candidate], str | None]:
+        """One page, plus the cursor for the next one when there is one."""
+
+        limit = min(max(int(max_results), 1), 1000)
+        params: dict[str, Any] = {"query": query, "max_results": limit}
+        if next_token:
+            params["next_token"] = next_token
+        payload = self._request("GET", "/2/users/search", params=params)
         data = payload.get("data", [])
         if not isinstance(data, list):
             raise MockXPlatformError("Mock X search returned an invalid user list.")
-        return [Candidate.from_dict(user) for user in data[:limit]]
+        meta = payload.get("meta") or {}
+        cursor = meta.get("next_token") if isinstance(meta, dict) else None
+        return (
+            [Candidate.from_dict(user) for user in data[:limit]],
+            str(cursor) if cursor else None,
+        )
 
     def lookup_username(self, username: str) -> Candidate | None:
         """One profile for one handle, or None when no such account exists."""

@@ -26,7 +26,7 @@ def platform_client(tmp_path):
 def test_http_search_health_and_dm_round_trip(platform_client) -> None:
     assert platform_client.health()["status"] == "ok"
 
-    candidates = platform_client.search_users("John Doe XYZ Toronto", max_results=50)
+    candidates = platform_client.search_users("John Doe XYZ Toronto", max_results=10)
     assert len(candidates) == 10
     assert candidates[0].id == "1000001"
     assert candidates[0].can_dm is True

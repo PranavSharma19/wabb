@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from config import load_settings
 
-from .application import MockXApplication, MockXHttpError
+from .application import DEFAULT_MAX_RESULTS, MockXApplication, MockXHttpError
 from .store import MockXStore
 
 
@@ -59,8 +59,15 @@ class MockXRequestHandler(BaseHTTPRequestHandler):
             if method == "GET" and parsed.path == "/2/users/search":
                 query = parse_qs(parsed.query)
                 search_text = query.get("query", [""])[0]
-                max_results = _as_int(query.get("max_results", ["10"])[0], "max_results")
-                self._json(HTTPStatus.OK, self.app.search_users(search_text, max_results))
+                # Absent max_results means X's default of 100, not ours of 10.
+                max_results = _as_int(
+                    query.get("max_results", [str(DEFAULT_MAX_RESULTS)])[0], "max_results"
+                )
+                cursor = query.get("next_token", [""])[0] or None
+                self._json(
+                    HTTPStatus.OK,
+                    self.app.search_users(search_text, max_results, cursor),
+                )
                 return
 
             lookup_match = USER_LOOKUP_PATTERN.fullmatch(parsed.path)

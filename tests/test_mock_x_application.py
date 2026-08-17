@@ -11,10 +11,11 @@ def app(tmp_path) -> MockXApplication:
     return MockXApplication(MockXStore(tmp_path / "mock-x.sqlite3"))
 
 
-def test_search_is_x_shaped_relevant_and_capped(app: MockXApplication) -> None:
-    result = app.search_users("John Doe XYZ Toronto", max_results=100)
+def test_search_is_x_shaped_and_relevant(app: MockXApplication) -> None:
+    result = app.search_users("John Doe XYZ Toronto", max_results=10)
 
-    assert result["meta"] == {"result_count": 10, "mock": True}
+    assert result["meta"]["result_count"] == 10
+    assert result["meta"]["mock"] is True
     assert len(result["data"]) == 10
     assert result["data"][0]["id"] == "1000001"
     assert "description" in result["data"][0]
@@ -53,7 +54,7 @@ def test_injected_failure_is_consumed_then_operation_recovers(
         app.search_users("John Doe")
 
     assert error.value.status == 429
-    assert app.search_users("John Doe")["meta"]["result_count"] == 10
+    assert app.search_users("John Doe", max_results=10)["meta"]["result_count"] == 10
 
 
 def test_reset_clears_messages_and_failures(app: MockXApplication) -> None:
@@ -62,7 +63,7 @@ def test_reset_clears_messages_and_failures(app: MockXApplication) -> None:
 
     assert app.reset() == {"ok": True}
     assert app.all_messages()["data"] == []
-    assert app.search_users("John Doe")["data"]
+    assert app.search_users("John Doe", max_results=10)["meta"]["result_count"] == 10
 
 
 def test_handle_lookup_resolves_one_profile(app: MockXApplication) -> None:
@@ -146,3 +147,37 @@ def test_a_search_bills_the_page_not_the_pool_behind_it(tmp_path) -> None:
     assert len(returned) == 5
     assert pooled > 20, "fixture too small to distinguish page from pool"
     assert store.ledger.distinct_profiles == 5
+
+
+def test_max_results_follows_x_not_us(app: MockXApplication) -> None:
+    # X's documented bounds: min 1, default 100, max 1000. Our old cap of ten was
+    # ours, and it hid the fact that omitting the parameter costs $1.00 a search.
+    assert len(app.search_users("John Doe")["data"]) == 12
+    assert len(app.search_users("John Doe", max_results=3)["data"]) == 3
+    assert len(app.search_users("John Doe", max_results=5000)["data"]) == 12
+
+
+def test_pagination_walks_the_pool_without_repeating_anybody(
+    app: MockXApplication,
+) -> None:
+    first = app.search_users("John Doe", max_results=5)
+    token = first["meta"]["next_token"]
+    second = app.search_users("John Doe", max_results=5, next_token=token)
+
+    first_ids = [profile["id"] for profile in first["data"]]
+    second_ids = [profile["id"] for profile in second["data"]]
+    assert len(second_ids) == 5
+    assert not set(first_ids) & set(second_ids)
+
+
+def test_a_cursor_from_another_query_is_refused(app: MockXApplication) -> None:
+    token = app.search_users("John Doe", max_results=5)["meta"]["next_token"]
+
+    with pytest.raises(MockXHttpError) as error:
+        app.search_users("Maya Chen", max_results=5, next_token=token)
+
+    assert error.value.status == 400
+
+
+def test_the_last_page_carries_no_cursor(app: MockXApplication) -> None:
+    assert "next_token" not in app.search_users("John Doe", max_results=1000)["meta"]
