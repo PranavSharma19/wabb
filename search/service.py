@@ -49,6 +49,29 @@ def find_users(
     return rank_candidates(candidates[:10], criteria)
 
 
+def lookup_user(
+    username: str,
+    *,
+    client: UserSearchClient | None = None,
+    settings: Settings | None = None,
+) -> Candidate | None:
+    """Resolve one profile from a handle, skipping the search loop entirely.
+
+    Deliberately uncached. A lookup returns one profile for one User charge, and
+    X already deduplicates a repeated profile inside its 24-hour window, so a
+    local cache would save nothing while risking a stale DM-eligibility flag on
+    the one profile the user is about to message.
+    """
+
+    handle = str(username or "").strip().lstrip("@")
+    if not handle:
+        return None
+    active_settings = settings or load_settings()
+    active_client = client or _make_client(active_settings)
+    logger.info("[LOOKUP] Resolving @%s", handle)
+    return active_client.lookup_username(handle)
+
+
 def _make_client(settings: Settings) -> UserSearchClient:
     if settings.mock_x:
         if settings.mock_x_base_url:

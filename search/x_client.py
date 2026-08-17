@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -15,6 +16,7 @@ class XClient:
     """Thin adapter over X API v2 so raw API JSON stays out of the application."""
 
     BASE_URL = "https://api.x.com/2/users/search"
+    LOOKUP_URL = "https://api.x.com/2/users/by/username/{username}"
     USER_FIELDS = (
         "id,name,username,description,location,profile_image_url,verified,"
         "is_identity_verified,receives_your_dm"
@@ -58,6 +60,37 @@ class XClient:
         if not isinstance(data, list):
             raise XApiError("X API response did not contain a valid user list.")
         return [_candidate_from_x(user) for user in data[:limit]]
+
+    def lookup_username(self, username: str) -> Candidate | None:
+        """Resolve one handle. One User billed, against ten for a search."""
+
+        handle = str(username or "").strip().lstrip("@")
+        try:
+            response = requests.get(
+                self.LOOKUP_URL.format(username=quote(handle, safe="")),
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                params={"user.fields": self.USER_FIELDS},
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise XApiError(f"Could not reach the X API: {exc}") from exc
+
+        # X reports a missing account both ways depending on the endpoint: a 404,
+        # or a 200 whose payload carries `errors` and no `data`. Both mean the
+        # same thing to the caller.
+        if response.status_code == 404:
+            return None
+        if not response.ok:
+            detail = _error_detail(response)
+            raise XApiError(f"X API request failed ({response.status_code}): {detail}")
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise XApiError("X API returned a non-JSON response.") from exc
+
+        data = payload.get("data")
+        return _candidate_from_x(data) if isinstance(data, dict) else None
 
 
 def _candidate_from_x(user: dict[str, Any]) -> Candidate:

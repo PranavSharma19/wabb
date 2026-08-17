@@ -4,7 +4,7 @@ from config import Settings
 from models.candidate import Candidate
 from models.criteria import RecipientCriteria
 from mock_x_platform.client import MockXPlatformClient
-from search.service import find_users
+from search.service import find_users, lookup_user
 from storage.cache import JsonSearchCache
 
 
@@ -50,3 +50,29 @@ def test_settings_select_the_standalone_mock_platform(monkeypatch, tmp_path) -> 
     results = find_users(RecipientCriteria(name="John Doe"), settings=settings)
 
     assert results[0].id == "remote"
+
+
+def test_lookup_user_resolves_a_handle_without_searching(tmp_path) -> None:
+    class LookupClient:
+        cache_namespace = "test"
+
+        def __init__(self) -> None:
+            self.searches: list[str] = []
+            self.lookups: list[str] = []
+
+        def search_users(self, query: str, max_results: int = 10) -> list[Candidate]:
+            self.searches.append(query)
+            return []
+
+        def lookup_username(self, username: str) -> Candidate | None:
+            self.lookups.append(username)
+            return Candidate(id="1", name="Joe Bart", username=username)
+
+    client = LookupClient()
+    settings = Settings(True, "", Path(tmp_path / "unused.json"))
+    found = lookup_user("@jbart", client=client, settings=settings)
+
+    assert found is not None and found.username == "jbart"
+    # The whole point of the shortcut: the search path is never entered.
+    assert client.searches == []
+    assert client.lookups == ["jbart"]
