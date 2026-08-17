@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from mock_x_platform.refinement import build_refinement_cases
+from mock_x_platform.store import MockXStore
+
+
+def _store(tmp_path, *, description: str, location: str) -> MockXStore:
+    store = MockXStore(tmp_path / "x.sqlite3")
+    store.replace_profiles(
+        [
+            {
+                "id": "9001",
+                "name": "Joe Bart",
+                "username": "joebart9001",
+                "description": description,
+                "location": location,
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "clean",
+                "follower_count": 10,
+            }
+        ]
+    )
+    store.replace_evaluation_cases(
+        [
+            {
+                "id": 1,
+                "description": "Joe Bart",
+                "criteria_json": json.dumps(
+                    {
+                        "name": "Joe Bart",
+                        "company": "Meta",
+                        "role": "Engineer",
+                        "location": "San Francisco, CA",
+                        "school": "McGill University",
+                        "extra_clues": [],
+                    }
+                ),
+                "expected_profile_id": "9001",
+            }
+        ]
+    )
+    return store
+
+
+def test_a_clue_the_profile_carries_is_labeled_on_profile(tmp_path) -> None:
+    store = _store(
+        tmp_path,
+        description="Engineer at Meta. McGill University alum.",
+        location="San Francisco, CA",
+    )
+
+    case = build_refinement_cases(store)[0]
+    types = {turn.field: turn.type for turn in case.turns}
+
+    assert types["role"] == "on_profile"
+    assert types["school"] == "on_profile"
+    assert types["location"] == "on_profile"
+
+
+def test_a_clue_the_profile_does_not_carry_is_labeled_off_profile(tmp_path) -> None:
+    # The partial tier: no bio, no location. Everything the sender knows about
+    # this person is true and invisible to the platform.
+    store = _store(tmp_path, description="", location="")
+
+    case = build_refinement_cases(store)[0]
+
+    assert {turn.type for turn in case.turns if turn.field in {"role", "school", "location"}} == {
+        "off_profile"
+    }
+
+
+def test_every_ladder_ends_with_the_handle(tmp_path) -> None:
+    store = _store(tmp_path, description="", location="")
+
+    case = build_refinement_cases(store)[0]
+
+    assert case.turns[-1].type == "handle"
+    assert case.turns[-1].value == "joebart9001"
+
+
+def test_the_initial_criteria_are_deliberately_underspecified(tmp_path) -> None:
+    store = _store(tmp_path, description="", location="")
+
+    case = build_refinement_cases(store)[0]
+
+    assert case.initial_criteria.name == "Joe Bart"
+    assert case.initial_criteria.company == "Meta"
+    assert case.initial_criteria.role == ""
+
+
+def test_a_correctable_name_earns_a_narrowing_turn(tmp_path) -> None:
+    store = _store(tmp_path, description="", location="")
+    store.replace_profiles(
+        [
+            {
+                "id": "9001",
+                "name": "Joe Bart",
+                "username": "joebart9001",
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "handle_name",
+                "follower_count": 10,
+            }
+        ]
+    )
+    store.replace_evaluation_cases(
+        [
+            {
+                "id": 1,
+                "description": "Joseph Bart",
+                "criteria_json": json.dumps(
+                    {"name": "Joseph Bart", "company": "Meta", "extra_clues": []}
+                ),
+                "expected_profile_id": "9001",
+            }
+        ]
+    )
+
+    case = build_refinement_cases(store)[0]
+
+    # "He goes by Joe, not Joseph" -- shares the surname, not the whole name.
+    assert [turn.type for turn in case.turns if turn.type == "narrowing_name"] == [
+        "narrowing_name"
+    ]
+
+
+@pytest.mark.parametrize("display_name", ["Joe Bart", "jbart"])
+def test_a_name_nobody_could_guess_earns_no_narrowing_turn(
+    tmp_path, display_name: str
+) -> None:
+    # Two exclusions, for opposite reasons. An identical display name has
+    # nothing to correct. A handle-style one ("jbart") shares no token, and a
+    # user able to produce that string would have used handle mode -- crediting
+    # search with it would hide the population the recovery path exists for.
+    store = _store(tmp_path, description="", location="")
+    store.replace_profiles(
+        [
+            {
+                "id": "9001",
+                "name": display_name,
+                "username": "joebart9001",
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "handle_name",
+                "follower_count": 10,
+            }
+        ]
+    )
+
+    case = build_refinement_cases(store)[0]
+
+    assert not any(turn.type == "narrowing_name" for turn in case.turns)
+
+
+def test_case_generation_is_deterministic_under_a_fixed_seed(tmp_path) -> None:
+    store = _store(tmp_path, description="Engineer at Meta.", location="")
+
+    first = build_refinement_cases(store, seed=7)
+    second = build_refinement_cases(store, seed=7)
+
+    assert [turn.field for turn in first[0].turns] == [
+        turn.field for turn in second[0].turns
+    ]
