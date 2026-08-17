@@ -35,8 +35,16 @@ DEDUP_WINDOW = "UTC calendar day"
 
 
 def window_key(moment: datetime) -> str:
-    """Which deduplication window a moment falls in."""
+    """Which deduplication window a moment falls in.
 
+    A naive datetime is read as UTC rather than as local system time. Python's
+    astimezone() would otherwise convert from whatever timezone the host happens
+    to sit in, which would make the same ledger bill differently on a laptop and
+    in CI -- silently, and in a module whose whole purpose is a reproducible number.
+    """
+
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
