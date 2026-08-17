@@ -3,6 +3,9 @@
 Date: 2026-08-17
 Status: approved for planning
 Supersedes: nothing. Builds on rounds 1–6 (name-primary query, dirt tiers, narrowed FTS index, acceptance gate).
+Revised after review: handle entry became an explicit mode rather than a detector over
+free speech (Task 1), and cost simulation was extended from the refinement harness to
+every accuracy run (Task 2).
 
 ## 1. Problem
 
@@ -169,43 +172,54 @@ code. Whoever runs it updates §3 of this document with the answer.
 mock's flags exist so the probe's answer selects a setting rather than triggering a
 rewrite.
 
-### Task 1 — Handle shortcut
+### Task 1 — Handle entry as an explicit mode
 
 The user who already knows the handle should never enter the search loop.
 
-New `parsing/handle_detector.py`:
+**It is a separate button, not a detector.** The recipient screen offers two record
+affordances — *Describe someone* and *Enter handle* — and since the front controls
+are now a touchscreen, the second costs no hardware. The mode is chosen before the
+user speaks, so the device knows which of two things it is listening for.
+
+That deletes the hardest problem in the original design. X handles are
+`[A-Za-z0-9_]{1,15}`, so "message at **Meta**" is a syntactically valid handle, and
+no dominance heuristic over free speech reliably separates a handle from the
+preposition "at" — a wrong guess shows the user a confidently incorrect profile
+card. With an explicit mode there is nothing to disambiguate: in describe mode a
+handle is never looked for, in handle mode a description is never parsed. The
+ambiguity is not resolved more cleverly, it is designed out.
+
+New `parsing/handle_transcript.py`:
 
 ```python
-def detect_handle(text: str) -> str | None: ...
+def parse_handle(text: str) -> str | None: ...
 ```
 
-Run **before** `parse_recipient_description`. On a hit, skip search entirely: a new
-`lookup_username()` on the client protocol resolves one profile in one call
-($0.010), and the device goes straight to a single-candidate confirm screen — 1/1,
-arrows inert, Refine falling back to the normal description flow.
+Still real work, because the transcript never contains a clean `@`. Forms to cover:
+`at jay bart`, `jay bart` (bare), `j b a r t` (spelled out), `jbart underscore dev`,
+`his handle is jbart`. It strips a leading "at"/"@", joins spelled-out letter runs,
+maps spoken punctuation ("underscore", "dot"), lowercases, and validates against
+`^[A-Za-z0-9_]{1,15}$`.
 
-**The hard part is the false positive.** X handles are `[A-Za-z0-9_]{1,15}`, so
-"message at **Meta**" parses as a valid handle and would resolve to a real account,
-showing the user a confidently wrong card. Syntax alone cannot separate a handle
-from the preposition "at". Detection therefore fires only when the handle is
-*dominant*:
+Note that a leading "at" is now unambiguously the `@` — the exact opposite of the
+reading the same token needs in describe mode. That inversion is only safe because
+the mode is known, which is precisely the argument for the button.
 
-- a literal `@` appears in the transcript, **or**
-- an explicit "handle" / "username" keyword appears, **or**
-- the utterance reduces to a bare single token after stripping lead-in verbs
-  ("message", "DM", "find", "send a message to").
+Resolution is a **lookup, not a search**: a new `lookup_username()` on the client
+protocol returns one profile for one User ($0.010, versus $0.10 for a ten-result
+search). The device goes straight to a single-candidate confirm screen — 1/1, arrows
+inert.
 
-"Joe Bart at Meta" has a name before the "at" and must not fire. Ambiguity resolves
-toward the search loop, which is recoverable, rather than toward a wrong profile,
-which is not.
+**Failure is now loud, not silent.** The original design fell through to normal
+search without telling the user, which is right for a guess and wrong for a
+deliberate choice: the user asked for one specific account, so an unresolvable
+handle is an answer, not a mis-detection. On no such user the device says so and
+offers to describe the person instead.
 
-ASR forms to cover, since the transcript never contains a clean `@`:
-`at jay bart`, `j b a r t` (spelled out), `jbart underscore dev`, `at johndoe`,
-`his handle is jbart`.
-
-New state: `AppState.HANDLE_LOOKUP` between `RECIPIENT_TRANSCRIBING` and
-`SELECT_PROFILE`. Failure to resolve falls through to normal search silently — the
-user should never see "handle not found", only the ordinary candidate list.
+New states: `AppState.HANDLE_RECORDING` → `HANDLE_LOOKUP` → `SELECT_PROFILE`, with
+the not-found path returning to the recipient screen carrying a message. Reached
+from the recipient screen's second button, and — per Task 5 — from the exhausted
+search loop.
 
 ### Task 2 — Pagination and cost model in the mock
 
@@ -217,9 +231,6 @@ ten. It gains X's actual shape:
 - `max_results` honouring X's real bounds (1–1000, default 100), so a caller that
   forgets the parameter reproduces the $1.00 mistake in the harness rather than in
   production.
-- A **billing ledger**: distinct profile ids served per 24-hour window, so the
-  harness reports dollars, not requests. This is the metric §4 cares about and it
-  cannot be reconstructed from request counts.
 - `match_scope` flag (Unknown A): `name_username` | `name_username_bio`, changing
   which columns the FTS index covers.
 - `result_order` flag (Unknown B): `bm25` | `follower_weighted`. Requires a
@@ -229,6 +240,41 @@ ten. It gains X's actual shape:
 
 Existing tests that pin round 4's narrowed index must keep passing under the
 `name_username` default. Any that need updating get a stated reason in the diff.
+
+**The billing ledger.** New `mock_x_platform/pricing.py`, holding X's published
+rates from §2 in one table with the date they were checked, and a ledger that
+records every profile id served with its timestamp. Cost is then derived, not
+counted: distinct ids per 24-hour UTC window × $0.010, plus lookups and any DM
+sends at their own rates. Requests are *not* the billable unit and the ledger must
+not pretend they are — the whole point of §2 is that ten repeat fetches of the same
+ten profiles cost $0.10, not $1.00.
+
+**Every accuracy run reports what it would have cost.** Not just the refinement
+harness — `run_evaluation` gains a cost block in its summary and report:
+
+```
+cost:
+  distinct_profiles: 41,207        billed_windows: 1
+  searches: 6,000    lookups: 0
+  estimated_usd: 412.07            per_case_usd: 0.0687
+```
+
+The per-case figure is the one that matters for product decisions, since it is what
+a real recipient search costs a real user. The run total will be large and that is
+informative rather than alarming: it is the price of the corpus we sweep, not of a
+device session, and the report should label it that way so nobody reads a $400
+evaluation as a $400 product.
+
+Two implementation traps worth naming now:
+
+- The ledger must attach where profiles are **served** (`MockXStore`), not to the
+  mock HTTP layer. Most of the existing suite calls the store directly with
+  `run_http=False`, so a ledger on the HTTP boundary would report $0.00 for nearly
+  every run — a number that looks like a passing result.
+- Cost is **reported, not gated**. No acceptance threshold on dollars this round:
+  round 6's rule is that a check must be observed failing under an injected
+  regression before it is trusted, and there is no baseline yet to set a bound
+  against. Task 5's numbers are what make a threshold possible later.
 
 ### Task 3 — Refinement harness
 
@@ -252,7 +298,7 @@ and blending them would hide the finding:
 | `on_profile` | clue appears in the profile's bio or location | discriminate only |
 | `off_profile` | clue is true of the person but absent from their X profile | **never** |
 | `narrowing_name` | fuller or corrected name | yes — changes the query |
-| `handle` | the user produces the handle | yes — exits the loop |
+| `handle` | the user gives up describing and switches to handle mode | yes — exits the loop |
 
 `off_profile` is first-class, not an edge case. It is the Joe Bart scenario exactly:
 information the user has that the platform does not hold. Everyone's intuition says
@@ -296,10 +342,14 @@ Conditional on Task 3's report supporting it.
 ### Task 5 — Re-run and report
 
 Before/after on everything that moves, under both match scopes, with the ordering
-model as a sensitivity check on the headline. Plus one product output that falls
-directly out of the unconvergeable fraction: a device state that says *"I can't find
-them — do you know their handle?"*, which is the moment Task 1 stops being a
-convenience and becomes the recovery path.
+model as a sensitivity check on the headline, and the §2 cost figures alongside —
+the phase should end knowing what convergence *costs*, not only whether it happens.
+
+Plus one product output that falls directly out of the unconvergeable fraction: when
+the search loop exhausts its budget the device says *"I can't find them — do you know
+their handle?"* and routes into `HANDLE_RECORDING`. This is where Task 1 stops being
+a shortcut for people who already knew and becomes the recovery path for people who
+did not know they needed it. It also answers how the second button gets discovered.
 
 ## 6. Out of scope
 
@@ -326,15 +376,25 @@ Deliberately excluded, each for a stated reason:
 | Unknown A resolves to "matches bio", making Task 4 largely unnecessary | Task 0 costs $0.20 and is specified now; Task 3 reports under both scopes, so the work is not wasted either way |
 | Convergence numbers are an artifact of the mock's arbitrary ordering | Ordering flag; headline reported under both models |
 | Depth-on-demand ships an unbounded bill | Budget cap is part of Task 4's definition, not a follow-up; the mock's ledger makes the bill visible in tests |
-| Handle detector fires on "at Meta" | Dominance rule; ambiguity resolves toward the recoverable path |
+| Nobody finds the handle button, so the shortcut goes unused | Task 5's exhausted-search state routes users into it at the moment they want it |
+| The evaluation's total cost figure is read as a per-user cost | Report leads with per-case dollars and labels the total as corpus sweep, not device session |
 | Task 3 grows past one phase | It is the phase's deliverable; Tasks 4–5 are explicitly conditional on its report |
 
 ## 8. Testing
 
-- Handle detector: table-driven over ASR forms, including the negatives
-  ("Joe Bart at Meta", "message at Google").
-- Pagination: cursor stability, no duplicate ids across pages, ledger arithmetic,
-  `max_results` bounds matching X's documented 1/100/1000.
+- Handle transcript parser: table-driven over ASR forms, plus the rejections
+  (over 15 characters, illegal characters, empty after stripping). The mode
+  separation gets a state-machine test rather than a parser test — describe-mode
+  input must never reach `parse_handle`, and handle-mode input must never reach
+  `parse_recipient_description`.
+- Handle lookup failure: an unresolvable handle surfaces a state the user can act
+  on, and is never silently converted into a search.
+- Pagination: cursor stability, no duplicate ids across pages, `max_results` bounds
+  matching X's documented 1/100/1000.
+- Pricing: a profile served twice in one window bills once and twice across a window
+  boundary; a lookup bills one User; the rate table carries its checked-on date; a
+  `run_http=False` run reports a non-zero cost, which is the regression that would
+  otherwise pass unnoticed.
 - Both mock flags: existing round-4 tests must pass unchanged under the
   `name_username` default.
 - Refinement harness: determinism under fixed seed; a deliberately unconvergeable
