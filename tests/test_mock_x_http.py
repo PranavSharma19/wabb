@@ -68,3 +68,25 @@ def test_http_handle_lookup_round_trip(platform_client) -> None:
 
 def test_http_handle_lookup_returns_none_for_a_missing_account(platform_client) -> None:
     assert platform_client.lookup_username("nobodyhome") is None
+
+
+def test_a_cursor_survives_the_http_round_trip(platform_client) -> None:
+    # The one path the application-layer pagination tests cannot reach: the
+    # cursor is minted by the server, crosses JSON and requests, and has to come
+    # back into decode_cursor intact on the second call.
+    first, token = platform_client.search_users_page("John Doe", max_results=5)
+    assert len(first) == 5
+    assert token
+
+    second, _ = platform_client.search_users_page(
+        "John Doe", max_results=5, next_token=token
+    )
+    assert len(second) == 5
+    assert not {item.id for item in first} & {item.id for item in second}
+
+
+def test_a_cursor_is_refused_for_a_different_query_over_http(platform_client) -> None:
+    _, token = platform_client.search_users_page("John Doe", max_results=5)
+
+    with pytest.raises(MockXPlatformError, match="400"):
+        platform_client.search_users_page("Maya Chen", max_results=5, next_token=token)

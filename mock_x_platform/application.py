@@ -104,7 +104,14 @@ class MockXApplication:
         max_results: int = DEFAULT_MAX_RESULTS,
         next_token: str | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
-        """Run the real search path and expose preliminary IDs for offline evaluation."""
+        """Run the real search path and expose preliminary IDs for offline evaluation.
+
+        The IDs come back in relevance order, not pool-insertion order, since
+        pagination now slices the same relevance-sorted list the page itself is
+        drawn from. The one caller only tests these IDs for set membership, so
+        the ordering is not load-bearing there -- but a caller that started
+        relying on position would be relying on relevance, not the store.
+        """
 
         self._raise_injected_failure("search")
         if not QUERY_PATTERN.fullmatch(query or ""):
