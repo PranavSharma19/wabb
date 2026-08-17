@@ -326,3 +326,47 @@ def test_the_run_reports_what_it_would_have_cost(tmp_path) -> None:
 
     assert summary["cost"]["distinct_profiles"] > 0
     assert summary["cost"]["estimated_usd"] > 0
+
+
+def test_reordering_the_same_ten_is_not_a_re_retrieval() -> None:
+    # The single most load-bearing decision in the harness. rank_candidates
+    # reorders the same ten profiles on every turn; counting that as
+    # re-retrieval would invert the phase's central finding. The end-to-end
+    # tests above cannot reliably distinguish this from a buggy list
+    # comparison -- rank_candidates sorts by a deterministic total order, so a
+    # wholly inert clue leaves the *ordered* list identical too, and a list
+    # comparison only gets caught when a fixture happens to contain a
+    # competitor the clue promotes. This test pins it directly.
+    from models.criteria import RecipientCriteria
+
+    from mock_x_platform.refinement import RefinementCase, _row
+
+    case = RefinementCase(
+        id=1,
+        expected_profile_id="3",
+        initial_criteria=RecipientCriteria(name="Joe Bart"),
+        turns=(),
+    )
+    reordered = _row(
+        case,
+        index=1,
+        turn_type="on_profile",
+        field="role",
+        rank=2,
+        previous=5,
+        top_ids=["3", "1", "2"],
+        previous_ids=["1", "2", "3"],
+    )
+    assert reordered["retrieval_changed"] is False
+
+    swapped = _row(
+        case,
+        index=1,
+        turn_type="on_profile",
+        field="role",
+        rank=2,
+        previous=5,
+        top_ids=["1", "2", "4"],
+        previous_ids=["1", "2", "3"],
+    )
+    assert swapped["retrieval_changed"] is True

@@ -271,10 +271,17 @@ def _rank_of(
     leaves the query byte-identical and the page byte-identical, and only
     `rank_candidates` reorders what was already there. Recording the ids is what
     lets the report say "re-ranked" rather than "re-retrieved".
+
+    A query the mock rejects (outside its allowed character set) is recorded as
+    "not visible" rather than allowed to raise, so one malformed case cannot
+    abort a multi-hour sweep over a corpus we have not seen before.
     """
 
     query = build_search_query(criteria)
-    response = application.search_users(query, VISIBLE_DEPTH)
+    try:
+        response = application.search_users(query, VISIBLE_DEPTH)
+    except MockXHttpError:
+        return None, []
     ranked = rank_candidates(
         [Candidate.from_dict(profile) for profile in response["data"]], criteria
     )
@@ -345,8 +352,16 @@ def _row(
         "field": field,
         "rank": rank,
         "visible": rank is not None,
-        "improved": _moved(previous, rank) > 0,
-        "worsened": _moved(previous, rank) < 0,
+        # Turn 0 has no prior turn to compare against, so it cannot have
+        # "improved" or "worsened" -- gated on `index > 0`, not on `previous is
+        # not None`. Those are not the same condition: `previous` is also None
+        # whenever the prior turn was a genuine miss (rank not found), and a
+        # later turn recovering from that miss -- rank going from None to
+        # found -- is a real improvement that must still be counted. Gating on
+        # `previous is not None` would silently zero out exactly the
+        # miss-to-hit transitions the handle turn exists to produce.
+        "improved": index > 0 and _moved(previous, rank) > 0,
+        "worsened": index > 0 and _moved(previous, rank) < 0,
         # The structural question, separate from the ranking one: did this turn
         # change *who* was retrieved, or only the order they were shown in?
         # Compared as sets on purpose -- rank_candidates reorders the same ten
@@ -423,7 +438,13 @@ def _summarize(
             "monotonicity_violations": sum(row["worsened"] for row in refinement_rows),
             "structurally_unconvergeable": _ratio(len(unreachable), len(per_case)),
             "unconvergeable_cases": len(unreachable),
-            "mean_profiles_purchased": (
+            # Marginal, not per-session: BillingLedger.record_profiles dedups
+            # against the whole run, so a profile an earlier case already paid
+            # for costs a later case nothing. This is systematically below what
+            # one case run in isolation would buy, and moves with how much the
+            # corpus overlaps across cases rather than with the phenomenon being
+            # measured. See the same caveat on the "cost" block below.
+            "marginal_profiles_purchased_per_case": (
                 round(sum(purchased) / len(purchased), 4) if purchased else 0.0
             ),
         },
@@ -435,9 +456,16 @@ def _summarize(
 def _turn_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     count = len(rows)
     if not count:
+        # None, not 0.0 -- an unmeasured turn type (for example narrowing_name
+        # on a corpus where no case earns one) must be distinguishable from a
+        # measured 0% visible rate. Conflating the two would make an absence
+        # read as a finding, and narrowing_name is the one search turn that can
+        # actually change the query, so its absence would silently turn the
+        # "0 re-retrieved" headline into a tautology computed only over turn
+        # types that provably cannot re-retrieve.
         return {
             "turns": 0,
-            "visible": 0.0,
+            "visible": None,
             "improved": 0,
             "worsened": 0,
             "unchanged": 0,
@@ -477,8 +505,9 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
         f"{'worsened':>10}{'re-retrieved':>14}"
     )
     for turn_type, metrics in summary["by_turn_type"].items():
+        visible = "n/a" if metrics["visible"] is None else f"{metrics['visible']:.1%}"
         print(
-            f"  {turn_type:18}{metrics['turns']:>8,}{metrics['visible']:>10.1%}"
+            f"  {turn_type:18}{metrics['turns']:>8,}{visible:>10}"
             f"{metrics['improved']:>10,}{metrics['worsened']:>10,}"
             f"{metrics['retrieval_changed']:>14,}"
         )
@@ -490,7 +519,8 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
     )
     print(
         f"  monotonicity violations {convergence['monotonicity_violations']:,}"
-        f"   profiles purchased/case: {convergence['mean_profiles_purchased']:.1f}"
+        f"   marginal profiles/case: "
+        f"{convergence['marginal_profiles_purchased_per_case']:.1f}"
     )
     print(
         f"  unconvergeable          {convergence['structurally_unconvergeable']:.1%}"
