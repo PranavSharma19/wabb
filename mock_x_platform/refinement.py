@@ -7,14 +7,25 @@ so a no-op is proven rather than asserted.
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import random
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
+from config import PROJECT_ROOT, load_settings
+from models.candidate import Candidate
 from models.criteria import RecipientCriteria
 from ranking.normalization import normalize_text
+from ranking.ranker import rank_candidates
+from search.query_builder import build_search_query
 
-from .store import MockXStore
+from .application import MockXApplication, MockXHttpError
+from .store import MATCH_SCOPES, RESULT_ORDERS, MockXStore
 
 
 TURN_TYPES = ("on_profile", "off_profile", "narrowing_name", "handle")
@@ -138,3 +149,396 @@ def build_refinement_cases(
 def _visible(profile_tokens: set[str], clue: str) -> bool:
     tokens = set(normalize_text(clue).split())
     return bool(tokens) and tokens <= profile_tokens
+
+
+# The visible screen is ten profiles. Success is arriving on it, not arriving
+# first: the device's own principle is that the AI ranks and the human confirms.
+VISIBLE_DEPTH = 10
+
+# How deep to look when asking whether a person is reachable at all. This probe
+# goes through the store rather than the API, so it is never billed.
+REACHABILITY_DEPTH = 1000
+
+
+def run_refinement(
+    database_path: str | Path,
+    *,
+    output_directory: str | Path,
+    case_limit: int | None = None,
+    match_scope: str = "name_username",
+    result_order: str = "bm25",
+    seed: int = 42,
+) -> tuple[dict[str, Any], Path, Path]:
+    """Drive every ladder and report whether refinement converges."""
+
+    database = Path(database_path)
+    store = MockXStore(database, match_scope=match_scope, result_order=result_order)
+    application = MockXApplication(store)
+    cases = build_refinement_cases(store, limit=case_limit, seed=seed)
+    if not cases:
+        raise RuntimeError("No evaluation cases exist. Generate the dataset first.")
+
+    started = time.perf_counter()
+    rows: list[dict[str, Any]] = []
+    per_case: list[dict[str, Any]] = []
+    for case in cases:
+        purchased_before = store.ledger.distinct_profiles
+        # Turn 0 is the first search, before any refinement. Every later index
+        # is one thing the user said.
+        rank, identifiers = _rank_of(
+            application, case.initial_criteria, case.expected_profile_id
+        )
+        ranks = [rank]
+        rows.append(
+            _row(
+                case,
+                index=0,
+                turn_type="initial",
+                field="",
+                rank=rank,
+                previous=None,
+                top_ids=identifiers,
+                previous_ids=None,
+            )
+        )
+        for index, turn in enumerate(case.turns, start=1):
+            previous_ids = identifiers
+            rank, identifiers = (
+                _handle_rank(application, turn.value, case.expected_profile_id)
+                if turn.type == "handle"
+                else _rank_of(application, turn.criteria, case.expected_profile_id)
+            )
+            rows.append(
+                _row(
+                    case,
+                    index=index,
+                    turn_type=turn.type,
+                    field=turn.field,
+                    rank=rank,
+                    previous=ranks[-1],
+                    top_ids=identifiers,
+                    previous_ids=previous_ids,
+                )
+            )
+            ranks.append(rank)
+
+        search_ranks = ranks[: len(ranks) - 1]  # everything before the handle turn
+        visible_at = next(
+            (index for index, rank in enumerate(search_ranks) if rank is not None), None
+        )
+        per_case.append(
+            {
+                "case_id": case.id,
+                "expected_profile_id": case.expected_profile_id,
+                "turns": len(case.turns),
+                "turns_to_visible": visible_at,
+                "converged_by_search": visible_at is not None,
+                "reachable": _reachable(store, case),
+                "profiles_purchased": store.ledger.distinct_profiles - purchased_before,
+            }
+        )
+
+    summary = _summarize(
+        cases,
+        rows,
+        per_case,
+        store=store,
+        match_scope=match_scope,
+        result_order=result_order,
+        seed=seed,
+        database=database,
+        duration=time.perf_counter() - started,
+    )
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    json_path = output / f"refinement-{match_scope}-{result_order}-{stamp}.json"
+    csv_path = output / f"refinement-{match_scope}-{result_order}-{stamp}.csv"
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_csv(csv_path, rows)
+    _print_summary(summary, json_path, csv_path)
+    return summary, json_path, csv_path
+
+
+def _rank_of(
+    application: MockXApplication, criteria: RecipientCriteria, expected_id: str
+) -> tuple[int | None, list[str]]:
+    """Where the expected profile lands on the visible screen, and who is on it.
+
+    Both halves matter and they are not the same measurement. The rank can move
+    while the retrieved set does not: `build_search_query` returns the first
+    non-empty of name, company, school, role, so adding a role or a location
+    leaves the query byte-identical and the page byte-identical, and only
+    `rank_candidates` reorders what was already there. Recording the ids is what
+    lets the report say "re-ranked" rather than "re-retrieved".
+    """
+
+    query = build_search_query(criteria)
+    response = application.search_users(query, VISIBLE_DEPTH)
+    ranked = rank_candidates(
+        [Candidate.from_dict(profile) for profile in response["data"]], criteria
+    )
+    identifiers = [candidate.id for candidate in ranked]
+    rank = identifiers.index(expected_id) + 1 if expected_id in identifiers else None
+    return rank, identifiers
+
+
+def _handle_rank(
+    application: MockXApplication, handle: str, expected_id: str
+) -> tuple[int | None, list[str]]:
+    """A handle turn resolves one account, so it is rank 1 or nothing."""
+
+    try:
+        resolved = application.lookup_user_by_username(handle)["data"]
+    except MockXHttpError:
+        return None, []
+    identifier = str(resolved["id"])
+    return (1 if identifier == expected_id else None), [identifier]
+
+
+def _reachable(store: MockXStore, case: RefinementCase) -> bool:
+    """Is this person reachable by any search anywhere in the ladder?
+
+    Every criteria state is checked except the handle turn's, because
+    narrowing_name changes the query and can rescue a case the opening name
+    could not reach. Checking only the opening state would overstate the
+    unconvergeable share.
+
+    False here is the structurally unconvergeable case: no ranking change, no
+    refinement turn and no amount of extra depth recovers them, and only the
+    handle does. That share is the product finding.
+
+    Goes through the store rather than the API, so asking the question costs
+    nothing and never appears in the bill.
+    """
+
+    states = [
+        case.initial_criteria,
+        *(turn.criteria for turn in case.turns if turn.type != "handle"),
+    ]
+    for criteria in states:
+        query = build_search_query(criteria)
+        if not query:
+            continue
+        rows = store.search_profiles(query, limit=REACHABILITY_DEPTH)
+        if any(str(row["id"]) == case.expected_profile_id for row in rows):
+            return True
+    return False
+
+
+def _row(
+    case: RefinementCase,
+    *,
+    index: int,
+    turn_type: str,
+    field: str,
+    rank: int | None,
+    previous: int | None,
+    top_ids: list[str],
+    previous_ids: list[str] | None,
+) -> dict[str, Any]:
+    return {
+        "case_id": case.id,
+        "expected_profile_id": case.expected_profile_id,
+        "turn_index": index,
+        "turn_type": turn_type,
+        "field": field,
+        "rank": rank,
+        "visible": rank is not None,
+        "improved": _moved(previous, rank) > 0,
+        "worsened": _moved(previous, rank) < 0,
+        # The structural question, separate from the ranking one: did this turn
+        # change *who* was retrieved, or only the order they were shown in?
+        # Compared as sets on purpose -- rank_candidates reorders the same ten
+        # every turn, and reordering is exactly what this must not count.
+        "retrieval_changed": (
+            previous_ids is not None and set(top_ids) != set(previous_ids)
+        ),
+        "top_ids": "|".join(top_ids),
+    }
+
+
+def _moved(previous: int | None, current: int | None) -> int:
+    """Positive when the target rose, negative when it fell, zero when it stayed.
+
+    A miss is treated as one place worse than the deepest visible rank, so
+    falling off the screen counts as falling rather than as no change.
+    """
+
+    if previous is None and current is None:
+        return 0
+    before = VISIBLE_DEPTH + 1 if previous is None else previous
+    after = VISIBLE_DEPTH + 1 if current is None else current
+    return before - after
+
+
+def _summarize(
+    cases: list[RefinementCase],
+    rows: list[dict[str, Any]],
+    per_case: list[dict[str, Any]],
+    *,
+    store: MockXStore,
+    match_scope: str,
+    result_order: str,
+    seed: int,
+    database: Path,
+    duration: float,
+) -> dict[str, Any]:
+    refinement_rows = [row for row in rows if row["turn_index"] > 0]
+    by_type = {
+        turn_type: _turn_metrics(
+            [row for row in refinement_rows if row["turn_type"] == turn_type]
+        )
+        for turn_type in TURN_TYPES
+    }
+    indexes = sorted({row["turn_index"] for row in rows})
+    by_index = {
+        str(index): _turn_metrics([row for row in rows if row["turn_index"] == index])
+        for index in indexes
+    }
+    converged = [item for item in per_case if item["converged_by_search"]]
+    unreachable = [item for item in per_case if not item["reachable"]]
+    purchased = [item["profiles_purchased"] for item in per_case]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "duration_seconds": round(duration, 3),
+        "database": str(database.resolve()),
+        "match_scope": match_scope,
+        "result_order": result_order,
+        "seed": seed,
+        "case_count": len(cases),
+        "turn_count": len(refinement_rows),
+        "by_turn_type": by_type,
+        "by_turn_index": by_index,
+        "convergence": {
+            "rate": _ratio(len(converged), len(per_case)),
+            "mean_turns_to_visible": (
+                round(
+                    sum(item["turns_to_visible"] for item in converged) / len(converged),
+                    4,
+                )
+                if converged
+                else None
+            ),
+            "monotonicity_violations": sum(row["worsened"] for row in refinement_rows),
+            "structurally_unconvergeable": _ratio(len(unreachable), len(per_case)),
+            "unconvergeable_cases": len(unreachable),
+            "mean_profiles_purchased": (
+                round(sum(purchased) / len(purchased), 4) if purchased else 0.0
+            ),
+        },
+        "cost": store.ledger.summary(case_count=len(cases)),
+        "cases": per_case[:200],
+    }
+
+
+def _turn_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    count = len(rows)
+    if not count:
+        return {
+            "turns": 0,
+            "visible": 0.0,
+            "improved": 0,
+            "worsened": 0,
+            "unchanged": 0,
+            "retrieval_changed": 0,
+        }
+    return {
+        "turns": count,
+        "visible": _ratio(sum(row["visible"] for row in rows), count),
+        "improved": sum(row["improved"] for row in rows),
+        "worsened": sum(row["worsened"] for row in rows),
+        "unchanged": sum(
+            not row["improved"] and not row["worsened"] for row in rows
+        ),
+        "retrieval_changed": sum(row["retrieval_changed"] for row in rows),
+    }
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 6) if denominator else 0.0
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as destination:
+        writer = csv.DictWriter(destination, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> None:
+    print(
+        f"\nRefinement: {summary['case_count']:,} cases, "
+        f"{summary['turn_count']:,} turns  "
+        f"[scope={summary['match_scope']} order={summary['result_order']}]"
+    )
+    print(
+        f"  {'turn type':18}{'turns':>8}{'visible':>10}{'improved':>10}"
+        f"{'worsened':>10}{'re-retrieved':>14}"
+    )
+    for turn_type, metrics in summary["by_turn_type"].items():
+        print(
+            f"  {turn_type:18}{metrics['turns']:>8,}{metrics['visible']:>10.1%}"
+            f"{metrics['improved']:>10,}{metrics['worsened']:>10,}"
+            f"{metrics['retrieval_changed']:>14,}"
+        )
+    convergence = summary["convergence"]
+    mean_turns = convergence["mean_turns_to_visible"]
+    print(
+        f"\n  convergence by search   {convergence['rate']:.1%}"
+        f"   mean turns to visible: {'n/a' if mean_turns is None else f'{mean_turns:.2f}'}"
+    )
+    print(
+        f"  monotonicity violations {convergence['monotonicity_violations']:,}"
+        f"   profiles purchased/case: {convergence['mean_profiles_purchased']:.1f}"
+    )
+    print(
+        f"  unconvergeable          {convergence['structurally_unconvergeable']:.1%}"
+        f"   ({convergence['unconvergeable_cases']:,} cases reachable only by handle)"
+    )
+    cost = summary["cost"]
+    print(
+        f"  estimated cost          ${cost['per_case_usd'] or 0:.4f}/case"
+        f"   (run total ${cost['estimated_usd']:,.2f})"
+    )
+    print(f"JSON report: {json_path}")
+    print(f"CSV detail: {csv_path}")
+
+
+def main() -> int:
+    settings = load_settings()
+    parser = argparse.ArgumentParser(description="Measure recipient refinement convergence")
+    parser.add_argument("--database", default=str(settings.mock_x_database_path))
+    parser.add_argument("--output", default=str(PROJECT_ROOT / ".cache" / "refinement"))
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--scope",
+        default="both",
+        choices=[*MATCH_SCOPES, "both"],
+        help="What the query matches. 'both' reports under each, because we do not know.",
+    )
+    parser.add_argument(
+        "--order",
+        default="bm25",
+        choices=[*RESULT_ORDERS, "both"],
+        help="How results are sorted. A sensitivity check on the headline number.",
+    )
+    args = parser.parse_args()
+    scopes = list(MATCH_SCOPES) if args.scope == "both" else [args.scope]
+    orders = list(RESULT_ORDERS) if args.order == "both" else [args.order]
+    for scope in scopes:
+        for order in orders:
+            run_refinement(
+                args.database,
+                output_directory=args.output,
+                case_limit=args.limit,
+                match_scope=scope,
+                result_order=order,
+                seed=args.seed,
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

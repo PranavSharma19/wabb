@@ -231,3 +231,98 @@ def test_determinism_holds_across_a_multi_case_run(tmp_path) -> None:
     ] == [
         [(turn.type, turn.field, turn.value) for turn in case.turns] for case in second
     ]
+
+
+def test_off_profile_refinement_changes_nothing_at_all(tmp_path) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+
+    summary, _, _ = run_refinement(
+        database, output_directory=tmp_path / "reports", case_limit=25
+    )
+
+    # The finding this whole phase exists to establish, asserted against the code
+    # as it stands. build_search_query returns the first non-empty of name,
+    # company, school, role -- location is not even a fallback -- so adding a
+    # clue leaves the query byte-identical and the same ten profiles come back.
+    off_profile = summary["by_turn_type"]["off_profile"]
+    assert off_profile["turns"] > 0
+    assert off_profile["retrieval_changed"] == 0
+
+    # The target can never rise on such a turn: scoring only ever adds points,
+    # the expected profile earns none from a clue its account does not carry,
+    # and competitors may earn some. So an off-profile clue is either inert or
+    # actively harmful, and `worsened` is left free to be non-zero because a
+    # refinement that demotes the target is a real result worth reporting.
+    assert off_profile["improved"] == 0
+
+
+def test_the_handle_turn_converges_where_search_cannot(tmp_path) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+
+    summary, _, _ = run_refinement(
+        database, output_directory=tmp_path / "reports", case_limit=25
+    )
+
+    assert summary["by_turn_type"]["handle"]["visible"] == 1.0
+
+
+def test_an_unreachable_person_is_reported_as_unconvergeable_not_as_a_failure(
+    tmp_path,
+) -> None:
+    from mock_x_platform.refinement import run_refinement
+
+    # Built by hand rather than sampled, so the case is unreachable by
+    # construction: the account displays "jbart" and shares no token with the
+    # name the sender has. This is the handle_name tier in miniature, and no
+    # ranking change, refinement turn or extra depth can ever recover it.
+    store = _store(tmp_path, description="", location="")
+    store.replace_profiles(
+        [
+            {
+                "id": "9001",
+                "name": "jbart",
+                "username": "jbart",
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "handle_name",
+                "follower_count": 10,
+            }
+        ]
+    )
+
+    summary, _, _ = run_refinement(
+        store.path, output_directory=tmp_path / "reports"
+    )
+
+    assert summary["convergence"]["structurally_unconvergeable"] == 1.0
+    assert summary["convergence"]["unconvergeable_cases"] == 1
+    assert summary["convergence"]["rate"] == 0.0
+    # And yet the handle turn still resolves them. That contrast is the product
+    # finding: past a certain amount of dirt, only the handle works.
+    assert summary["by_turn_type"]["handle"]["visible"] == 1.0
+
+
+def test_the_run_reports_what_it_would_have_cost(tmp_path) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+
+    summary, _, _ = run_refinement(
+        database, output_directory=tmp_path / "reports", case_limit=25
+    )
+
+    assert summary["cost"]["distinct_profiles"] > 0
+    assert summary["cost"]["estimated_usd"] > 0
