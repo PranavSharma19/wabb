@@ -60,3 +60,18 @@ def test_lookup_username_returns_none_when_the_account_does_not_exist(monkeypatc
 
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: Response())
     assert XClient("token").lookup_username("nobodyhome") is None
+
+
+def test_lookup_username_returns_none_when_x_reports_errors_without_data(monkeypatch) -> None:
+    # X's other way of saying "no such account": 200, an errors array, no data.
+    class Response:
+        status_code = 200
+        ok = True
+        reason = "OK"
+        text = ""
+
+        def json(self):
+            return {"errors": [{"title": "Not Found Error"}]}
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: Response())
+    assert XClient("token").lookup_username("nobodyhome") is None
