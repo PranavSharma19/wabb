@@ -11,7 +11,15 @@ from .store import MockXStore
 
 OWNER_ID = "9000000"
 QUERY_PATTERN = re.compile(r"^[A-Za-z0-9_' ]{1,50}$")
-FAILURE_OPERATIONS = {"search", "send_dm", "list_dm"}
+# X's real limit is 15 characters, and `parse_handle` enforces it on the way in,
+# where a spoken handle is the thing being validated. This check is deliberately
+# looser: it guards against malformed input reaching the store, and the mock's
+# own generated corpus contains usernames like `isabella_rodriguez_4507` that
+# exceed 15. Re-asserting X's rule here would make the API refuse to resolve
+# profiles that exist in the fixture, which is the mock being pedantic about a
+# rule its own dataset breaks. See "What this plan deliberately does not do".
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,50}$")
+FAILURE_OPERATIONS = {"search", "lookup", "send_dm", "list_dm"}
 
 
 class MockXHttpError(RuntimeError):
@@ -87,6 +95,35 @@ class MockXApplication:
             "meta": {"result_count": len(profiles), "mock": True},
         }
         return result, [str(profile["id"]) for profile in source]
+
+    def lookup_user_by_username(self, username: str) -> dict[str, Any]:
+        """Resolve one profile by handle -- X's /2/users/by/username/:username.
+
+        A lookup, not a search: one profile in and one profile out, so it bills
+        one User where a ten-result search bills ten.
+        """
+
+        self._raise_injected_failure("lookup")
+        handle = str(username or "").strip().lstrip("@")
+        if not USERNAME_PATTERN.fullmatch(handle):
+            raise MockXHttpError(
+                400,
+                "username must be 1 to 15 characters of letters, digits or underscore",
+                "Invalid username",
+            )
+        profile = self.store.get_profile_by_username(handle)
+        if profile is None:
+            profile = next(
+                (
+                    dict(item)
+                    for item in MOCK_PROFILES
+                    if str(item["username"]).casefold() == handle.casefold()
+                ),
+                None,
+            )
+        if profile is None:
+            raise MockXHttpError(404, f"User @{handle} was not found.", "User not found")
+        return {"data": profile}
 
     def send_message(self, participant_id: str, text: str) -> dict[str, Any]:
         self._raise_injected_failure("send_dm")

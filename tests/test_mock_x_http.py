@@ -57,3 +57,14 @@ def test_http_reset_clears_persisted_messages(platform_client) -> None:
     platform_client.send_message("1000001", "Temporary")
     platform_client.reset()
     assert platform_client.list_messages("1000001") == []
+
+
+def test_http_handle_lookup_round_trip(platform_client) -> None:
+    candidate = platform_client.lookup_username("@johndoe_xyz")
+
+    assert candidate is not None
+    assert candidate.id == "1000001"
+
+
+def test_http_handle_lookup_returns_none_for_a_missing_account(platform_client) -> None:
+    assert platform_client.lookup_username("nobodyhome") is None

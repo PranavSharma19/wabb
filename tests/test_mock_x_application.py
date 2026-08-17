@@ -63,3 +63,36 @@ def test_reset_clears_messages_and_failures(app: MockXApplication) -> None:
     assert app.reset() == {"ok": True}
     assert app.all_messages()["data"] == []
     assert app.search_users("John Doe")["data"]
+
+
+def test_handle_lookup_resolves_one_profile(app: MockXApplication) -> None:
+    result = app.lookup_user_by_username("johndoe_xyz")
+
+    assert result["data"]["id"] == "1000001"
+    assert result["data"]["username"] == "johndoe_xyz"
+
+
+def test_handle_lookup_is_case_insensitive_and_ignores_a_leading_at(
+    app: MockXApplication,
+) -> None:
+    assert app.lookup_user_by_username("@JohnDoe_XYZ")["data"]["id"] == "1000001"
+
+
+def test_handle_lookup_rejects_something_that_is_not_a_handle(
+    app: MockXApplication,
+) -> None:
+    with pytest.raises(MockXHttpError) as error:
+        app.lookup_user_by_username("this is far too long to be one")
+
+    assert error.value.status == 400
+
+
+def test_handle_lookup_reports_a_missing_account_as_missing(
+    app: MockXApplication,
+) -> None:
+    # 404 rather than an empty list: the user asked for one specific account, so
+    # "there is no such account" is an answer the device has to be able to show.
+    with pytest.raises(MockXHttpError) as error:
+        app.lookup_user_by_username("nobodyhome")
+
+    assert error.value.status == 404

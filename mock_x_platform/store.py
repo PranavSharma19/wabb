@@ -243,6 +243,16 @@ class MockXStore:
             ).fetchone()
         return _profile_row(row) if row is not None else None
 
+    def get_profile_by_username(self, username: str) -> dict[str, Any] | None:
+        """Resolve one profile by handle. Case-insensitive: X handles are."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM profiles WHERE username = ? COLLATE NOCASE",
+                (str(username or "").lstrip("@"),),
+            ).fetchone()
+        return _profile_row(row) if row is not None else None
+
     def profile_labels(self, ids: Iterable[str]) -> dict[str, dict[str, str]]:
         """Return `{id: {tier, name, username}}` for offline evaluation joins.
 

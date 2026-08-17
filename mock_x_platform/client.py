@@ -43,6 +43,17 @@ class MockXPlatformClient:
             raise MockXPlatformError("Mock X search returned an invalid user list.")
         return [Candidate.from_dict(user) for user in data[:limit]]
 
+    def lookup_username(self, username: str) -> Candidate | None:
+        """One profile for one handle, or None when no such account exists."""
+
+        payload = self._request(
+            "GET",
+            f"/2/users/by/username/{quote(str(username or '').lstrip('@'), safe='')}",
+            allow_missing=True,
+        )
+        data = payload.get("data")
+        return Candidate.from_dict(data) if isinstance(data, dict) else None
+
     def send_message(self, recipient_id: str, text: str) -> DirectMessage:
         payload = self._request(
             "POST",
@@ -86,7 +97,14 @@ class MockXPlatformClient:
     def reset(self) -> None:
         self._request("POST", "/__mock__/reset", json={})
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        allow_missing: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         try:
             response = self.session.request(
                 method,
@@ -98,6 +116,11 @@ class MockXPlatformClient:
             raise MockXPlatformError(
                 f"Could not reach the Mock X platform at {self.base_url}: {exc}"
             ) from exc
+        # A 404 on a lookup is data, not a failure: it means no such account.
+        # Every other non-OK status is still an error, including the 400 that a
+        # malformed handle earns.
+        if allow_missing and response.status_code == 404:
+            return {}
         try:
             payload = response.json()
         except ValueError as exc:

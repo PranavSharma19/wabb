@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from config import load_settings
 
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 1_000_000
 DM_SEND_PATTERN = re.compile(r"^/2/dm_conversations/with/([^/]+)/messages$")
 DM_LIST_PATTERN = re.compile(r"^/2/dm_conversations/with/([^/]+)/dm_events$")
+USER_LOOKUP_PATTERN = re.compile(r"^/2/users/by/username/([^/]+)$")
 
 
 def create_server(
@@ -60,6 +61,14 @@ class MockXRequestHandler(BaseHTTPRequestHandler):
                 search_text = query.get("query", [""])[0]
                 max_results = _as_int(query.get("max_results", ["10"])[0], "max_results")
                 self._json(HTTPStatus.OK, self.app.search_users(search_text, max_results))
+                return
+
+            lookup_match = USER_LOOKUP_PATTERN.fullmatch(parsed.path)
+            if method == "GET" and lookup_match:
+                self._json(
+                    HTTPStatus.OK,
+                    self.app.lookup_user_by_username(unquote(lookup_match.group(1))),
+                )
                 return
 
             send_match = DM_SEND_PATTERN.fullmatch(parsed.path)
