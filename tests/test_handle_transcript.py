@@ -34,6 +34,9 @@ def test_spoken_forms_resolve_to_one_handle(spoken: str, expected: str) -> None:
         # join it into a forty-character pseudo-handle and look it up.
         "joe bart a member of technical staff at meta",
         "jbart at gmail dot com",
+        "j dot bart",
+        "j dash bart",
+        "jbart period dev",
     ],
 )
 def test_things_that_are_not_handles_are_rejected(spoken: str) -> None:

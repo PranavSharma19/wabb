@@ -31,6 +31,14 @@ _LEAD_INS = (
 # translated into something the user did not say.
 _SPOKEN_SYMBOLS = ((" underscore ", "_"), (" under score ", "_"))
 
+# Spoken punctuation X cannot represent. Reaching the join step with one of
+# these still present means the user said a character that cannot appear in a
+# handle, so the answer is "that is not a handle" -- not a handle with the word
+# spelled into it.
+_REJECTED_SYMBOL_WORDS = frozenset(
+    {"dot", "period", "point", "dash", "hyphen", "minus", "slash", "space"}
+)
+
 
 def parse_handle(text: str) -> str | None:
     """Turn a spoken handle into an X username, or None if it is not one.
@@ -55,6 +63,9 @@ def parse_handle(text: str) -> str | None:
 
     for spoken, symbol in _SPOKEN_SYMBOLS:
         cleaned = cleaned.replace(spoken, symbol)
+
+    if set(cleaned.split()) & _REJECTED_SYMBOL_WORDS:
+        return None
 
     # A handle contains no spaces, so every space left is an artifact of
     # dictation: "j b a r t" and "jay bart" are each one handle. Anything long
