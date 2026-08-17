@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
-from typing import Any
 
 from models.criteria import RecipientCriteria
 from ranking.normalization import normalize_text

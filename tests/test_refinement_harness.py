@@ -173,3 +173,61 @@ def test_case_generation_is_deterministic_under_a_fixed_seed(tmp_path) -> None:
     assert [turn.field for turn in first[0].turns] == [
         turn.field for turn in second[0].turns
     ]
+
+
+def test_each_turn_carries_every_clue_said_before_it(tmp_path) -> None:
+    # The ladder is cumulative by definition: refinement is the user ADDING to
+    # what they already said. If a turn carried only its own field, every turn
+    # would be a fresh single-clue search and every convergence number this
+    # harness produces would be wrong in the same direction, silently.
+    store = _store(
+        tmp_path,
+        description="Engineer at Meta. McGill University alum.",
+        location="San Francisco, CA",
+    )
+
+    case = build_refinement_cases(store, seed=7)[0]
+    clue_turns = [turn for turn in case.turns if turn.field in {"role", "location", "school"}]
+    assert len(clue_turns) == 3
+
+    # The opening criteria never gain the later clues.
+    assert case.initial_criteria.role == ""
+    assert case.initial_criteria.location == ""
+    assert case.initial_criteria.school == ""
+
+    # Every turn keeps the name and company it started from...
+    for turn in clue_turns:
+        assert turn.criteria.name == "Joe Bart"
+        assert turn.criteria.company == "Meta"
+
+    # ...and the last clue turn carries all three clues at once, whatever order
+    # the seed shuffled them into.
+    final = clue_turns[-1].criteria
+    assert final.role and final.location and final.school
+
+    # ...while each earlier turn carries strictly fewer of them than the next.
+    filled = [
+        sum(bool(getattr(turn.criteria, field)) for field in ("role", "location", "school"))
+        for turn in clue_turns
+    ]
+    assert filled == [1, 2, 3]
+
+
+def test_determinism_holds_across_a_multi_case_run(tmp_path) -> None:
+    # One randomizer is shared across the whole call and consumed in case order,
+    # so a single-case store cannot exercise the sequencing at all.
+    from mock_x_platform.dataset import build_dataset
+
+    database = tmp_path / "corpus.sqlite3"
+    build_dataset(database, count=2_000, seed=42)
+    store = MockXStore(database)
+
+    first = build_refinement_cases(store, limit=40, seed=7)
+    second = build_refinement_cases(store, limit=40, seed=7)
+
+    assert len(first) == len(second) > 1
+    assert [
+        [(turn.type, turn.field, turn.value) for turn in case.turns] for case in first
+    ] == [
+        [(turn.type, turn.field, turn.value) for turn in case.turns] for case in second
+    ]
