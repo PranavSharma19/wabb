@@ -47,6 +47,23 @@ class MockXStore:
         self.ledger = ledger or BillingLedger()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        if self.result_order == "follower_weighted" and self._follower_counts_are_flat():
+            raise ValueError(
+                "result_order='follower_weighted' needs a corpus with follower counts, "
+                "and this database has none. It predates generator version 3. "
+                "Regenerate it with `python -m mock_x_platform.dataset` -- a run against "
+                "flat zero counts collapses to id order and would look successful while "
+                "measuring nothing."
+            )
+
+    def _follower_counts_are_flat(self) -> bool:
+        """True when a corpus exists but carries no follower signal at all."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS profiles, MAX(follower_count) AS peak FROM profiles"
+            ).fetchone()
+        return bool(int(row["profiles"])) and not int(row["peak"] or 0)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -205,7 +222,15 @@ class MockXStore:
 
     @staticmethod
     def _migrate_follower_count(connection: sqlite3.Connection) -> None:
-        """Add the follower column to a database generated before it existed."""
+        """Add the follower column to a database generated before it existed.
+
+        This only adds the column at DEFAULT 0; it does not populate it, because
+        the counts come from the generator, not from anything the store can
+        derive. A corpus migrated this way needs regenerating (generator version
+        3+) before result_order='follower_weighted' means anything -- see
+        `_follower_counts_are_flat`, which refuses to run that ordering against
+        an all-zero corpus instead of silently collapsing to id order.
+        """
 
         columns = {
             str(row["name"])
@@ -551,6 +576,10 @@ def _optional_flag(value: Any) -> int | None:
 def _profile_row(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result.pop("tier", None)
+    # Same reason as tier: a store-internal signal that must not reach an API
+    # response. follower_count models an ordering hypothesis about the real
+    # endpoint -- code under evaluation must not be able to read it directly.
+    result.pop("follower_count", None)
     result["verified"] = bool(result["verified"])
     dm = result.get("receives_your_dm")
     result["receives_your_dm"] = None if dm is None else bool(dm)

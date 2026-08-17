@@ -149,6 +149,12 @@ def test_the_bio_scope_can_see_the_bio(tmp_path) -> None:
 
 
 def test_follower_weighted_order_puts_the_personality_first(tmp_path) -> None:
+    # Paired baseline: show the flip, not just one side of it, so a regression
+    # to plain id order (e.g. `p.id DESC`) would be visible here too.
+    default = MockXStore(tmp_path / "default.sqlite3")
+    default.replace_profiles(_profiles())
+    assert [row["id"] for row in default.search_profiles("Joe Bart")] == ["1", "2"]
+
     store = MockXStore(tmp_path / "x.sqlite3", result_order="follower_weighted")
     store.replace_profiles(_profiles())
 
@@ -160,4 +166,23 @@ def test_follower_weighted_order_puts_the_personality_first(tmp_path) -> None:
 def test_an_unknown_flag_value_is_refused(tmp_path) -> None:
     with pytest.raises(ValueError):
         MockXStore(tmp_path / "x.sqlite3", match_scope="everything")
+    with pytest.raises(ValueError):
+        MockXStore(tmp_path / "x2.sqlite3", result_order="everything")
     assert "name_username" in MATCH_SCOPES and "bm25" in RESULT_ORDERS
+
+
+def test_follower_weighted_refuses_a_corpus_with_no_follower_signal(tmp_path) -> None:
+    # An older corpus gets the column at DEFAULT 0, so the ordering silently
+    # collapses to id order. Failing loudly beats a run that measures nothing.
+    database = tmp_path / "flat.sqlite3"
+    store = MockXStore(database)
+    store.replace_profiles([{**_profiles()[0], "follower_count": 0}])
+
+    with pytest.raises(ValueError, match="follower counts"):
+        MockXStore(database, result_order="follower_weighted")
+
+
+def test_follower_weighted_construction_does_not_raise_on_an_empty_database(tmp_path) -> None:
+    # A brand-new store has no profiles yet, so the flatness check must not
+    # mistake "nothing written" for "no follower signal."
+    MockXStore(tmp_path / "empty.sqlite3", result_order="follower_weighted")

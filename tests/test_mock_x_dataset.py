@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -216,15 +217,20 @@ def test_generated_profiles_carry_a_heavy_tailed_follower_count() -> None:
     assert ordered[-1] > 20 * ordered[len(ordered) // 2]
 
 
-def test_adding_follower_counts_did_not_disturb_the_existing_streams() -> None:
+def test_the_identity_and_dirt_streams_are_unchanged_by_follower_counts() -> None:
     from mock_x_platform.dataset import generate_profiles
 
+    # Pinned against the generator as it stood BEFORE follower counts existed.
+    # Comparing a run to itself would only prove determinism -- a draw taken from
+    # the `dirt` stream would shift every later dirt draw and still produce two
+    # identical runs, passing straight through the regression this guards.
     profiles = list(generate_profiles(300, seed=42))
-    names = [profile["name"] for profile in profiles]
-    tiers = [profile["tier"] for profile in profiles]
+    digest = hashlib.sha256(
+        "|".join(
+            f"{profile['id']}:{profile['name']}:{profile['username']}:"
+            f"{profile['tier']}:{profile['description']}:{profile['location']}"
+            for profile in profiles
+        ).encode("utf-8")
+    ).hexdigest()[:16]
 
-    # Follower counts come from a third RNG stream precisely so identities and
-    # dirt stay byte-identical to every corpus measured in earlier rounds.
-    again = list(generate_profiles(300, seed=42))
-    assert [profile["name"] for profile in again] == names
-    assert [profile["tier"] for profile in again] == tiers
+    assert digest == "e097000c440f3ca2"
