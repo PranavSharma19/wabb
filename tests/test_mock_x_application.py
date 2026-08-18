@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from mock_x_platform.application import OWNER_ID, MockXApplication, MockXHttpError
+from mock_x_platform.application import (
+    DEFAULT_MAX_RESULTS,
+    MAX_MAX_RESULTS,
+    OWNER_ID,
+    MockXApplication,
+    MockXHttpError,
+)
 from mock_x_platform.store import MockXStore
 
 
@@ -149,12 +155,62 @@ def test_a_search_bills_the_page_not_the_pool_behind_it(tmp_path) -> None:
     assert store.ledger.distinct_profiles == 5
 
 
-def test_max_results_follows_x_not_us(app: MockXApplication) -> None:
+def _crowd(store: MockXStore, count: int) -> None:
+    """Put `count` identically-named profiles in the store.
+
+    Every max_results assertion needs a corpus deeper than the bound it is
+    testing, or the corpus -- not the bound -- decides the answer. The twelve
+    hand-written fixtures are shallower than every bound in play, so against
+    them a default of 12, 10, 100 or 1000 all return the same twelve rows.
+    """
+
+    store.replace_profiles(
+        [
+            {
+                "id": str(2_000_000 + index),
+                "name": "John Doe",
+                "username": f"johndoe_{index:05d}",
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "clean",
+                "follower_count": 1,
+            }
+            for index in range(count)
+        ]
+    )
+
+
+def test_max_results_defaults_to_x_s_hundred_not_to_our_old_ten(
+    app: MockXApplication,
+) -> None:
     # X's documented bounds: min 1, default 100, max 1000. Our old cap of ten was
     # ours, and it hid the fact that omitting the parameter costs $1.00 a search.
-    assert len(app.search_users("John Doe")["data"]) == 12
+    # 1,100 candidates is deeper than every bound below, so each assertion is
+    # decided by the bound and not by how many profiles happen to exist.
+    _crowd(app.store, 1_100)
+
+    assert len(app.search_users("John Doe")["data"]) == DEFAULT_MAX_RESULTS == 100
+    # Pinned as an exact count, not `<= 100`: a default of 10 or of 1000 fails here.
+    assert app.search_users("John Doe")["meta"]["result_count"] == 100
+
+
+def test_max_results_is_clamped_to_x_s_floor_and_ceiling(app: MockXApplication) -> None:
+    _crowd(app.store, 1_100)
+
     assert len(app.search_users("John Doe", max_results=3)["data"]) == 3
-    assert len(app.search_users("John Doe", max_results=5000)["data"]) == 12
+    # Below the floor: X's minimum is 1, so 0 is clamped up rather than
+    # returning an empty page or raising.
+    assert len(app.search_users("John Doe", max_results=0)["data"]) == 1
+    # Above the ceiling: 1,100 people match, so a served page of exactly 1,000
+    # is the ceiling doing the work. This asserts the observable contract
+    # ("one page never exceeds MAX_MAX_RESULTS") rather than the specific line
+    # that enforces it, because the candidate pool is independently capped at
+    # 1,000 -- raising MAX_MAX_RESULTS alone would not show up anywhere else.
+    ceiling_page = app.search_users("John Doe", max_results=5_000)["data"]
+    assert len(ceiling_page) == MAX_MAX_RESULTS == 1_000
 
 
 def test_pagination_walks_the_pool_without_repeating_anybody(
@@ -181,3 +237,38 @@ def test_a_cursor_from_another_query_is_refused(app: MockXApplication) -> None:
 
 def test_the_last_page_carries_no_cursor(app: MockXApplication) -> None:
     assert "next_token" not in app.search_users("John Doe", max_results=1000)["meta"]
+
+
+def test_the_username_rejection_message_names_the_bound_it_enforces(
+    app: MockXApplication,
+) -> None:
+    # The endpoint deliberately allows 50 characters where X allows 15, because
+    # the generated corpus contains handles longer than X's rule. A message that
+    # says "1 to 15" therefore describes a rule this endpoint does not apply,
+    # and sends the reader looking for a bug in a handle that is perfectly legal.
+    long_handle = "isabella_rodriguez_4507"
+    assert len(long_handle) > 15
+    app.store.replace_profiles(
+        [
+            {
+                "id": "2000000",
+                "name": "Isabella Rodriguez",
+                "username": long_handle,
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "clean",
+                "follower_count": 1,
+            }
+        ]
+    )
+    assert app.lookup_user_by_username(long_handle)["data"]["id"] == "2000000"
+
+    with pytest.raises(MockXHttpError) as error:
+        app.lookup_user_by_username("a" * 51)
+
+    assert error.value.status == 400
+    assert "1 to 50" in error.value.detail
+    assert "15" not in error.value.detail

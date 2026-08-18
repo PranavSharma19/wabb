@@ -168,7 +168,13 @@ class MockXApplication:
         if not USERNAME_PATTERN.fullmatch(handle):
             raise MockXHttpError(
                 400,
-                "username must be 1 to 15 characters of letters, digits or underscore",
+                # 50, not X's 15, and the message has to say so: the bound
+                # named here is the bound USERNAME_PATTERN enforces. See the
+                # comment on USERNAME_PATTERN for why the mock is looser than X
+                # -- its own generated corpus contains handles X would reject,
+                # and a message promising 15 would send a reader hunting for a
+                # bug in a handle this endpoint resolves perfectly well.
+                "username must be 1 to 50 characters of letters, digits or underscore",
                 "Invalid username",
             )
         profile = self.store.get_profile_by_username(handle)
