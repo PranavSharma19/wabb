@@ -37,11 +37,20 @@ TURN_TYPES = ("on_profile", "off_profile", "narrowing_name", "handle")
 # reports have been observed to be bit-identical across the whole `result_order`
 # sweep. `observation_digest` is what settles it from the output alone.
 FLAG_SENSITIVITY_NOTE = (
-    "`observation_digest` fingerprints every row this run observed: the "
-    "(case_id, turn_index, rank, visible, retrieval_changed) tuple of each turn. "
-    "Two reports that share a digest saw the same people at the same ranks on "
-    "every turn, so the flag that differs between them was INERT for this "
-    "corpus and quoting them as two results is quoting one measurement twice. "
+    "`observation_digest` fingerprints what this run observed, in two halves: "
+    "the (case_id, turn_index, rank, visible, retrieval_changed) tuple of each "
+    "turn, and the (case_id, reachable, profiles_purchased) tuple of each case. "
+    "Two reports that share a digest put the target at the same rank on every "
+    "turn AND agree on which cases were reachable and how many profiles each "
+    "bought, so the flag that differs between them was INERT for this corpus "
+    "and quoting them as two results is quoting one measurement twice. The "
+    "per-case half is what makes that claim safe: `_reachable` probes the store "
+    "at depth 1000, so a flag can move `unconvergeable_cases` while every turn "
+    "lands identically, and a turns-only digest would call that inert. What is "
+    "still NOT covered: the identities of the other nine profiles on screen. "
+    "The digest counts each case's purchases rather than naming them, so a flag "
+    "that reshuffled the also-rans without moving the target, the reachability "
+    "or the count would read as inert here. "
     "Expect that outcome: (1) MockXApplication re-sorts the store's candidate "
     "pool by (-overlap, id) before cutting the page, and every profile matching "
     "all the query's tokens ties on overlap, so either result_order collapses "
@@ -454,7 +463,7 @@ def _summarize(
         # The two keys above name the settings; this one names the result. See
         # FLAG_SENSITIVITY_NOTE -- without it a reader has no way to tell a
         # sensitivity check from the same measurement filed twice.
-        "observation_digest": _observation_digest(rows),
+        "observation_digest": _observation_digest(rows, per_case),
         "flag_sensitivity": FLAG_SENSITIVITY_NOTE,
         "seed": seed,
         "case_count": len(cases),
@@ -529,16 +538,27 @@ def _turn_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _observation_digest(rows: list[dict[str, Any]]) -> str:
+def _observation_digest(
+    rows: list[dict[str, Any]], per_case: list[dict[str, Any]]
+) -> str:
     """A stable fingerprint of everything a run actually observed.
 
-    Deliberately narrow. It covers what was seen -- which case, which turn,
-    where the target landed, whether it was on screen, whether the retrieved set
-    moved -- and nothing about when the run happened, how long it took or which
-    flags were asked for. Two runs under different flags therefore produce the
-    same digest exactly when the flag changed nothing that this harness measures,
-    which is the question `match_scope` and `result_order` in the report header
-    look like they answer and do not.
+    Two halves, because the harness reports two kinds of number and a flag can
+    move one without the other. Per turn: which case, which turn, where the
+    target landed, whether it was on screen, whether the retrieved set moved.
+    Per case: whether the target was reachable at all, and how many profiles the
+    case bought.
+
+    The per-case half is not decoration. `_reachable` probes the store at depth
+    1000, far below the ten rows a turn ever sees, so `result_order` reorders
+    what falls inside that probe and changes `unconvergeable_cases` while every
+    turn of every case lands identically. A digest over turns alone is identical
+    across that difference, and anything reading "identical digest" as "the flag
+    moved nothing" would then be wrong in the harness's own report.
+
+    Excluded on purpose: when the run happened, how long it took, and which
+    flags were asked for -- a digest that moved with those could never answer
+    the question it exists to answer.
     """
 
     digest = hashlib.sha256()
@@ -551,6 +571,18 @@ def _observation_digest(rows: list[dict[str, Any]]) -> str:
                     "-" if row["rank"] is None else str(row["rank"]),
                     "1" if row["visible"] else "0",
                     "1" if row["retrieval_changed"] else "0",
+                )
+            ).encode("utf-8")
+        )
+        digest.update(b"\x1e")
+    digest.update(b"\x1d")
+    for item in per_case:
+        digest.update(
+            "\x1f".join(
+                (
+                    str(item["case_id"]),
+                    "1" if item["reachable"] else "0",
+                    str(item["profiles_purchased"]),
                 )
             ).encode("utf-8")
         )

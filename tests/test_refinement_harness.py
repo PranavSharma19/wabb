@@ -528,6 +528,64 @@ def test_two_flag_settings_that_measure_the_same_thing_share_a_digest(tmp_path) 
     assert len(set(digests.values())) == 1
 
 
+def test_the_digest_covers_reachability_not_only_the_turns(tmp_path) -> None:
+    # The gap that made the sweep's verdict false on the 100k corpus. `_reachable`
+    # probes the store at depth 1000, well below the ten rows any turn sees, so
+    # result_order reorders what falls inside that probe and moves
+    # unconvergeable_cases while every turn of every case lands in exactly the
+    # same place. A digest over turns alone is identical across that difference,
+    # and the sweep would print "result_order inert -- one measurement, not
+    # several" over two reports whose unconvergeable counts differ (58 vs 76 on
+    # the 100k corpus). Hand-built rather than run through the harness: the flag
+    # is invariant on every corpus small enough to build in a test, so the only
+    # way to fail for this claim is to feed the digest the difference directly.
+    from mock_x_platform.refinement import _observation_digest
+
+    rows = [
+        {
+            "case_id": "case-1",
+            "turn_index": 0,
+            "rank": 3,
+            "visible": True,
+            "retrieval_changed": False,
+        }
+    ]
+    reachable = [{"case_id": "case-1", "reachable": True, "profiles_purchased": 10}]
+    unreachable = [{"case_id": "case-1", "reachable": False, "profiles_purchased": 10}]
+    pricier = [{"case_id": "case-1", "reachable": True, "profiles_purchased": 11}]
+
+    assert _observation_digest(rows, reachable) == _observation_digest(rows, reachable)
+    assert _observation_digest(rows, reachable) != _observation_digest(rows, unreachable)
+    # Purchases too: a flag that changes which profiles a case buys has changed
+    # what the run cost, and "inert" must not be said over a cost difference.
+    assert _observation_digest(rows, reachable) != _observation_digest(rows, pricier)
+
+
+def test_the_digest_still_covers_the_turns(tmp_path) -> None:
+    # The other half, pinned separately so widening the payload cannot quietly
+    # drop what it was originally for.
+    from mock_x_platform.refinement import _observation_digest
+
+    per_case = [{"case_id": "case-1", "reachable": True, "profiles_purchased": 10}]
+    base = {
+        "case_id": "case-1",
+        "turn_index": 0,
+        "rank": 3,
+        "visible": True,
+        "retrieval_changed": False,
+    }
+
+    for field, changed in (
+        ("rank", 4),
+        ("visible", False),
+        ("retrieval_changed", True),
+        ("turn_index", 1),
+    ):
+        assert _observation_digest([base], per_case) != _observation_digest(
+            [{**base, field: changed}], per_case
+        ), f"digest ignores {field}"
+
+
 def test_the_report_explains_what_a_shared_digest_means(tmp_path) -> None:
     # A reader of one JSON file, with no access to this test suite, has to be
     # able to reach the right conclusion.
