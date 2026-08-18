@@ -70,7 +70,7 @@ python main.py
 
 This launches the original terminal interface. Use `python -m device_app` for the handheld UI.
 
-`MOCK_X=true` is the default, even if no `.env` exists. No network call or X credential is used in this mode. The mock source contains 12 deliberately similar profiles and returns at most 10 per search.
+`MOCK_X=true` is the default, even if no `.env` exists. No network call or X credential is used in this mode. The mock source contains 12 deliberately similar profiles, and the client asks for at most 10 per search.
 
 Try:
 
@@ -118,7 +118,8 @@ Implemented local routes:
 | Route | Purpose |
 |---|---|
 | `GET /health` | Service readiness |
-| `GET /2/users/search` | X-shaped user search, capped at 10 |
+| `GET /2/users/search` | X-shaped user search. `max_results` follows X: minimum 1, default 100, maximum 1000, with `next_token` paging |
+| `GET /2/users/by/username/{username}` | Resolve one profile by handle (the device's handle path) |
 | `POST /2/dm_conversations/with/{id}/messages` | Send a fake one-to-one DM |
 | `GET /2/dm_conversations/with/{id}/dm_events` | Read that fake conversation |
 | `GET /__mock__/messages` | Inspect all stored fake messages |
@@ -144,7 +145,7 @@ python -m mock_x_platform.dataset
 
 Restart `python -m mock_x_platform` afterward. The generator uses a fixed seed and includes the original ambiguous John Doe profiles plus broad synthetic variation across names, companies, roles, schools, locations, verification, and DM eligibility. It also stores 1,000 deterministic ground-truth cases pairing natural-language descriptions and structured criteria with the expected profile ID. Re-running the command replaces the generated profiles and evaluation cases while preserving fake messages.
 
-Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index over name and username, the two fields X's `/2/users/search` actually matches. Each search first retrieves at most 250 plausible profiles, applies deterministic mock relevance, and returns at most 10 for the application's detailed criteria ranker. This avoids scanning and sorting all 100,000 profiles per request.
+Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index over name and username, the two fields X's `/2/users/search` actually matches. Each search first retrieves a candidate pool -- at least 250 profiles, and as deep as the page being served -- then applies deterministic mock relevance and cuts the requested page from it. This avoids scanning and sorting all 100,000 profiles per request. The ten-result page the criteria ranker sees is the *client's* doing, not the mock's: `XClient` and `MockXClient` both send `max_results=10` deliberately, while the mock itself will serve up to 1000 and defaults to 100 when the parameter is omitted. Keeping those two apart is the point -- the mock reproduces X's real bounds so that omitting `max_results` costs what it would cost in production, and the client's ten is a separate, deliberate choice about what the device asks for.
 
 Profiles matching every query token lead the pool, followed by profiles matching any token; the full-query match is a ranking preference, not a filter. Indexing the bio and location was removed deliberately: document lengths then ranged from 3 to 24 tokens, and because bm25 divides by document length, sparse profiles floated to the top of the 250-row pool while rich profiles fell off the end of it — retrieval was being filtered by how complete a profile was.
 
@@ -199,6 +200,46 @@ Thresholds live in `CORPUS_THRESHOLDS` and are **calibrated for the documented d
 Clean and dirty corpora get separate threshold sets, selected automatically from the profile tiers in the database. They measure different things: on a clean corpus every profile carries the bio and location the ranker scores, so a shortfall is a defect; on a dirty corpus most of the shortfall is the corpus. Runs on a smaller corpus, or with `--limit`, clear the thresholds easily — that is the name space desaturating and the sample favouring low ids, not the search improving. The report says so explicitly when a run does not match the calibration.
 
 Every check records, in `catches`, the specific regression it exists to detect; the printed summary shows it for any check that fails. Checks that could not be tied to a regression were removed rather than left as decoration — the four extra top-10 checks were provably identical to `clean top-10` in every run, because all five well-formed variants build the same query and are handed the same ten rows. In their place the gate now checks that the formatting variant scores *identically* to clean (which is what actually verifies sanitization), gates the worst of the three missing-clue variants, and checks `handle_name` retrieval recall on its own. That last one earns its place: reverting the AND-as-preference change moves handle-tier recall from 0.225 to 0.005 while aggregate recall only slips from 0.933 to 0.909 and clears its own threshold, so the aggregate alone would let that regression through.
+
+### Multi-turn refinement
+
+Measure whether saying *more* about a person brings them onto the visible screen:
+
+```powershell
+python -m mock_x_platform.refinement --scope both --order both
+```
+
+Each evaluation case becomes a ladder. The sender leads with a name and a company, adds one clue per turn (role, location, school), and every ladder ends by giving the handle. A turn's type is read off the stored profile rather than assumed: a clue whose tokens all appear in the bio or location is `on_profile` and could in principle discriminate, one whose tokens do not is `off_profile` and provably cannot, whatever the ranker does with it. A turn that corrects the display name is `narrowing_name` — the only search turn that changes the query. Timestamped JSON and row-level CSV land in `.cache/refinement/`, and every report carries what the same run would have cost against the real X API.
+
+#### What the measurement found
+
+1,000 cases, 4,033 turns, 100,000-profile corpus, seed 42:
+
+| turn type | turns | visible | improved | worsened | re-retrieved |
+|---|---|---|---|---|---|
+| `on_profile` | 2,088 | 16.7% | 77 | 0 | 0 |
+| `off_profile` | 912 | 19.7% | 0 | 29 | 0 |
+| `narrowing_name` | 33 | 33.3% | 11 | 0 | 33 |
+| `handle` | 1,000 | 100% | 878 | 0 | 1,000 |
+
+Convergence by search 18.7%, mean turns to visible 0.24, 29 monotonicity violations, 5.8% structurally unconvergeable under `bm25` (7.6% under `follower_weighted`), $0.0872 per case — $87.18 for the run, 46.6 profiles per convergence.
+
+Read per case, of 1,000 recipient searches: **176 (17.6%) were already on screen before any refinement, 11 (1.1%) were rescued by speaking more, and 813 (81.3%) were reachable only by giving the handle.** None was unreachable by every path. Every one of the 11 rescues came from a `narrowing_name` turn.
+
+**Adding clues does not re-retrieve.** Across 3,000 `on_profile` and `off_profile` turns the retrieved set never changed once, because `build_search_query` is name-primary: those clues re-*rank* the same ten rows rather than fetching different ones. Only `narrowing_name` alters the query, and it is the only turn type with a non-zero `retrieval_changed`. This is why there is no "fetch more depth on demand" feature here — there is nothing for extra depth to find that the query did not already ask for.
+
+**Saying something true that the profile does not say makes things worse.** `off_profile` turns produced zero improvements and 29 demotions. On a device where the user cannot see why a result moved, a refinement that quietly demotes the right person is worse than one that does nothing.
+
+The product conclusion is the third row of the per-case reading: **for a saturated name space, the handle is the only reliable path**, which is what the separate handle button on the recipient screen exists for.
+
+#### Reading a sweep
+
+`match_scope` and `result_order` in a report name the store settings that produced it. They do not, on their own, make a run under a different setting a second measurement. Each report therefore also carries `observation_digest` and its two halves in `digest_parts`:
+
+- **`turns`** — every turn's `(case_id, turn_index, rank, visible, retrieval_changed)`. What a user would have seen.
+- **`cases`** — every case's `(reachable, profiles_purchased)`. What was true behind the screen.
+
+Across all four scope × order combinations of the run above, the `turns` digest is a **single** value: no flag moved any rank on any turn of any case. The `cases` digest does move — `result_order` shifts `unconvergeable_cases` between 58 and 76 because reachability is probed 1,000 profiles deep while a turn only ever sees ten, and `name_username_bio` buys 14 more profiles ($87.32 against $87.18). So the two flags change what is *measurable*, never what is *seen*, and the sweep says exactly that rather than reporting one measurement four times. Compare digests before quoting two reports as a sensitivity check.
 
 ## Offline voice input
 
@@ -290,7 +331,7 @@ This implementation follows X's current [User Search documentation](https://docs
 GET https://api.x.com/2/users/search
 ```
 
-It always sends `max_results=10`; X's [endpoint reference](https://docs.x.com/x-api/users/search-users) documents a much larger default, so the application never relies on that default. It requests:
+It always sends `max_results=10`; X's [endpoint reference](https://docs.x.com/x-api/users/search-users) documents a default of 100 and a maximum of 1000, so the application never relies on that default. The local mock implements those real bounds (see the route table above); the client's ten is what the device asks for, against either backend. It requests:
 
 ```text
 id,name,username,description,location,profile_image_url,

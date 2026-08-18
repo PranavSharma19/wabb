@@ -50,7 +50,18 @@ SCHOOLS = (
     "York University",
 )
 
-GENERATOR_VERSION = 2
+GENERATOR_VERSION = 3
+
+# Follower counts are heavy-tailed: most accounts have a few hundred, a handful
+# have millions, and nothing about them is normally distributed. Log-uniform over
+# 10^0.5 to 10^5.5 (roughly 3 to 320,000) reproduces the property Unknown B turns
+# on -- that a member of technical staff is systematically outranked by a
+# personality with the same name -- without pretending to be a measured census.
+FOLLOWER_LOG_RANGE = (0.5, 5.5)
+
+# The hand-written fixtures get a fixed, unremarkable count so they neither lead
+# nor trail under follower_weighted ordering.
+FIXTURE_FOLLOWER_COUNT = 1_000
 
 TIER_NAMES = ("clean", "partial", "decorated", "handle_name")
 
@@ -245,13 +256,20 @@ def generate_profiles(
     if count < len(MOCK_PROFILES):
         raise ValueError(f"count must be at least {len(MOCK_PROFILES)}")
     # The hand-written fixtures are complete profiles, so they are the clean tier.
-    yield from (dict(profile, tier="clean") for profile in MOCK_PROFILES)
+    yield from (
+        dict(profile, tier="clean", follower_count=FIXTURE_FOLLOWER_COUNT)
+        for profile in MOCK_PROFILES
+    )
     # Two streams on purpose: identities come from `randomizer`, dirt from
     # `dirt`. Because tier rendering never touches the identity stream, the same
     # seed produces the same people under any tier mix, so a clean run and a
     # dirty run are a paired comparison rather than two different populations.
     randomizer = random.Random(seed)
     dirt = random.Random(seed + 1)
+    # A third stream on purpose. Drawing follower counts from `dirt` would shift
+    # every later dirt draw and silently change the corpus that rounds 1-6 were
+    # measured against.
+    popularity = random.Random(seed + 2)
     generated = count - len(MOCK_PROFILES)
     tiers = _tier_sequence(generated, tier_mix, dirt)
     for index in range(generated):
@@ -272,7 +290,9 @@ def generate_profiles(
             "location": location,
             "school": school,
         }
-        yield _render_profile(tiers[index], truth, index + 1, dirt)
+        profile = _render_profile(tiers[index], truth, index + 1, dirt)
+        profile["follower_count"] = int(10 ** popularity.uniform(*FOLLOWER_LOG_RANGE))
+        yield profile
 
 
 def build_dataset(

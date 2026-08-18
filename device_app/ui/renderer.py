@@ -70,6 +70,17 @@ class DeviceRenderer:
             self._recipient_refinement(surface, controller, timestamp)
         elif state is AppState.SEARCHING:
             self._loading(surface, "SEARCHING FOR PEOPLE", "Checking the best matching profiles", timestamp)
+        elif state is AppState.HANDLE_RECORDING:
+            self._recording(surface, controller, timestamp, "SAY THE HANDLE", "Release when done")
+        elif state is AppState.HANDLE_LOOKUP:
+            self._loading(
+                surface,
+                "LOOKING UP HANDLE",
+                f"Resolving @{controller.context.handle}",
+                timestamp,
+            )
+        elif state is AppState.HANDLE_NOT_FOUND:
+            self._handle_not_found(surface, controller)
         elif state is AppState.SELECT_PROFILE:
             self._profile(surface, controller)
         elif state is AppState.RECORD_MESSAGE:
@@ -93,6 +104,7 @@ class DeviceRenderer:
         self._circle(surface, (82, 180), 27, self.theme.accent)
         self._text(surface, "Hold SPACE or ENTER to begin", (130, 150), self.font_title)
         self._text(surface, "Describe the person you want to reach", (132, 193), self.font_body, self.theme.muted)
+        self._text(surface, "H  I already know their @handle", (132, 222), self.font_small, self.theme.accent)
         self._text(surface, "HARDWARE EMULATION", (34, 288), self.font_label, self.theme.muted)
         self._rounded_panel(surface, (30, 326, 740, 70), self.theme.panel)
         self._text(surface, "LEFT / RIGHT  Profiles", (52, 345), self.font_small)
@@ -129,6 +141,17 @@ class DeviceRenderer:
         self._center_text(surface, '"Also went to U of T"', 255, self.font_small, self.theme.muted)
         self._center_text(surface, "Refining a result reruns search automatically", 330, self.font_small, self.theme.muted)
         self._footer(surface, "ESC / R  Back", "Hold SPACE / ENTER  Speak")
+
+    def _handle_not_found(self, surface: object, controller: DeviceController) -> None:
+        handle = controller.context.handle
+        self._eyebrow(surface, "HANDLE")
+        self._center_text(surface, "NO ACCOUNT FOUND", 92, self.font_title)
+        self._rounded_panel(surface, (90, 160, 620, 128), self.theme.panel)
+        subject = f"@{handle}" if handle else "That did not sound like a handle"
+        self._center_text(surface, subject, 190, self.font_body, self.theme.danger)
+        self._center_text(surface, "Hold SPACE or ENTER to describe them instead", 232, self.font_body)
+        self._center_text(surface, "H  Try another handle", 264, self.font_small, self.theme.muted)
+        self._footer(surface, "ESC  Home", "SPACE / ENTER  Describe instead")
 
     def _loading(self, surface: object, title: str, subtitle: str, now: float) -> None:
         self._center_text(surface, title, 126, self.font_title)

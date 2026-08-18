@@ -27,8 +27,10 @@ class ExistingSearchAdapter:
     def __init__(
         self,
         finder: Callable[[RecipientCriteria], list[Candidate]],
+        looker: Callable[[str], Candidate | None] | None = None,
     ) -> None:
         self._finder = finder
+        self._looker = looker
 
     def search(self, criteria: RecipientCriteria) -> SearchResult:
         domain_candidates = self._finder(
@@ -37,6 +39,16 @@ class ExistingSearchAdapter:
         return SearchResult(
             query=criteria_query(criteria),
             candidates=tuple(_from_domain(item) for item in domain_candidates),
+        )
+
+    def lookup(self, handle: str) -> SearchResult:
+        """Zero or one candidate. Empty is "no such account", not "search harder"."""
+
+        wanted = str(handle or "").strip().lstrip("@")
+        found = self._looker(wanted) if self._looker is not None else None
+        return SearchResult(
+            query=f"@{wanted}",
+            candidates=() if found is None else (_from_domain(found),),
         )
 
 
@@ -68,6 +80,16 @@ class MockSearchProvider:
             for candidate in ranked
         )
         return SearchResult(query=query, candidates=candidates)
+
+    def lookup(self, handle: str) -> SearchResult:
+        wanted = str(handle or "").strip().lstrip("@").casefold()
+        found = next(
+            (item for item in self._candidates if item.username.casefold() == wanted),
+            None,
+        )
+        return SearchResult(
+            query=f"@{wanted}", candidates=() if found is None else (found,)
+        )
 
 
 def _from_domain(candidate: Candidate) -> ProfileCandidate:

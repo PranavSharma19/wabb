@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import pytest
+
+from models.criteria import RecipientCriteria
+
+from device_app.actions import Action
+from device_app.events import WorkerEvent, WorkerEventType
+from device_app.search_contract import ProfileCandidate, SearchResult
+from device_app.state import AppState, DeviceController
+
+from tests.test_device_state import FakeRunner
+
+
+class HandleRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookup_calls: list[str] = []
+
+    def start_handle_lookup(self, handle: str) -> int:
+        operation_id = self.next_id
+        self.next_id += 1
+        self.lookup_calls.append(handle)
+        return operation_id
+
+
+FOUND = SearchResult(
+    query="@jbart",
+    candidates=(
+        ProfileCandidate(id="55", name="Joe Bart", username="jbart", profile_url="https://x.com/jbart"),
+    ),
+)
+
+
+def speak(controller: DeviceController, runner: HandleRunner, transcript: str) -> None:
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(operation_id, WorkerEventType.VOICE_COMPLETE, transcript, "handle_voice")
+    )
+    controller.update()
+
+
+def test_handle_mode_skips_the_search_loop_entirely() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+
+    controller.dispatch(Action.HANDLE_MODE)
+    assert controller.state is AppState.HANDLE_RECORDING
+    assert runner.voice_calls == ["handle_voice"]
+
+    speak(controller, runner, "his handle is jbart")
+    assert controller.state is AppState.HANDLE_LOOKUP
+    assert runner.lookup_calls == ["jbart"]
+    # The point of the shortcut: no search was ever started.
+    assert runner.search_calls == []
+
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    runner.emit(
+        WorkerEvent(operation_id, WorkerEventType.SEARCH_COMPLETE, FOUND, "handle_lookup")
+    )
+    controller.update()
+
+    assert controller.state is AppState.SELECT_PROFILE
+    assert len(controller.context.candidates) == 1
+    assert controller.current_candidate.username == "jbart"
+
+
+def test_an_unspeakable_handle_stops_rather_than_becoming_a_search() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+
+    controller.dispatch(Action.HANDLE_MODE)
+    speak(controller, runner, "joe bart a member of technical staff at meta")
+
+    # A deliberate handle request that cannot be parsed is an answer, not a
+    # mis-detection to be quietly converted into a description search.
+    assert controller.state is AppState.HANDLE_NOT_FOUND
+    assert runner.lookup_calls == []
+    assert runner.search_calls == []
+
+
+def test_an_unresolvable_handle_lands_on_not_found() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+
+    controller.dispatch(Action.HANDLE_MODE)
+    speak(controller, runner, "at nobodyhome")
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    runner.emit(
+        WorkerEvent(
+            operation_id,
+            WorkerEventType.SEARCH_COMPLETE,
+            SearchResult(query="@nobodyhome", candidates=()),
+            "handle_lookup",
+        )
+    )
+    controller.update()
+
+    assert controller.state is AppState.HANDLE_NOT_FOUND
+    assert controller.context.handle == "nobodyhome"
+
+
+def test_not_found_offers_both_ways_forward() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+    controller.dispatch(Action.HANDLE_MODE)
+    speak(controller, runner, "not a handle at all because it is far too long")
+
+    controller.dispatch(Action.SEND_DOWN)
+    assert controller.state is AppState.RECORD_RECIPIENT
+    assert runner.voice_calls[-1] == "initial_voice"
+
+
+def test_the_profile_screen_can_switch_to_the_handle_as_a_recovery_path() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+    controller.context.criteria = RecipientCriteria(name="Joe Bart")
+    controller.context.candidates = [
+        ProfileCandidate(id="7", name="Joe Bart", username="joebart7", profile_url="https://x.com/joebart7")
+    ]
+    controller.state = AppState.SELECT_PROFILE
+
+    controller.dispatch(Action.HANDLE_MODE)
+    assert controller.state is AppState.HANDLE_RECORDING
+
+    # Backing out of the recovery path must return the user to the candidate
+    # list they came from, with the search they already paid for intact --
+    # not to HOME, which discards the whole session.
+    controller.dispatch(Action.BACK)
+    assert controller.state is AppState.SELECT_PROFILE
+    assert controller.context.criteria.name == "Joe Bart"
+    assert [candidate.username for candidate in controller.context.candidates] == ["joebart7"]
+
+
+def test_a_not_found_handle_returns_to_the_candidate_list_it_came_from() -> None:
+    runner = HandleRunner()
+    controller = DeviceController(runner)
+    controller.context.criteria = RecipientCriteria(name="Joe Bart")
+    controller.state = AppState.SELECT_PROFILE
+
+    controller.dispatch(Action.HANDLE_MODE)
+    speak(controller, runner, "at nobodyhome")
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    runner.emit(
+        WorkerEvent(
+            operation_id,
+            WorkerEventType.SEARCH_COMPLETE,
+            SearchResult(query="@nobodyhome", candidates=()),
+            "handle_lookup",
+        )
+    )
+    controller.update()
+    assert controller.state is AppState.HANDLE_NOT_FOUND
+
+    controller.dispatch(Action.BACK)
+    assert controller.state is AppState.SELECT_PROFILE
+    assert controller.context.criteria.name == "Joe Bart"
+
+
+class RecordingController(DeviceController):
+    """A controller that remembers every state it ever entered.
+
+    Asserting on `controller.state` after each call only samples the states the
+    test happens to look at. Mode isolation is a claim about every state on the
+    path, including ones a transition passes straight through, so the assignment
+    itself is what gets recorded.
+    """
+
+    def __init__(self, runner: HandleRunner) -> None:
+        self.visited: list[AppState] = []
+        super().__init__(runner)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "state":
+            self.visited.append(value)  # type: ignore[arg-type]
+        super().__setattr__(name, value)
+
+
+HANDLE_STATES = {
+    AppState.HANDLE_RECORDING,
+    AppState.HANDLE_LOOKUP,
+    AppState.HANDLE_NOT_FOUND,
+}
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "at meta",
+        "@meta",
+        "message at meta",
+        "his handle is jbart",
+    ],
+)
+def test_a_description_that_looks_like_a_handle_still_goes_to_search(
+    transcript: str,
+) -> None:
+    # The other direction of mode isolation, and the one that makes "message at
+    # Meta" safe. Handle entry is an explicit mode rather than a detector
+    # precisely so that a description can never be mistaken for a handle -- but
+    # only the handle-never-searches half was pinned, so a detector could have
+    # been reintroduced on the description path without a single test failing.
+    runner = HandleRunner()
+    controller = RecordingController(runner)
+
+    controller.dispatch(Action.SEND_DOWN)
+    assert controller.state is AppState.RECORD_RECIPIENT
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id, WorkerEventType.VOICE_COMPLETE, transcript, "initial_voice"
+        )
+    )
+    controller.update()
+
+    assert controller.state is AppState.RECIPIENT_REVIEW
+    controller.dispatch(Action.SEND_DOWN)
+
+    assert controller.state is AppState.SEARCHING
+    assert len(runner.search_calls) == 1
+    assert runner.lookup_calls == []
+    # No handle recording was ever started either -- the mode is entered only by
+    # Action.HANDLE_MODE, which nothing on this path dispatches.
+    assert runner.voice_calls == ["initial_voice"]
+    assert not HANDLE_STATES & set(controller.visited)
+
+
+def test_a_spoken_refinement_that_looks_like_a_handle_still_refines() -> None:
+    runner = HandleRunner()
+    controller = RecordingController(runner)
+    controller.dispatch(Action.SEND_DOWN)
+    operation_id = controller.context.current_operation_id
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id,
+            WorkerEventType.VOICE_COMPLETE,
+            "Joe Bart at Meta",
+            "initial_voice",
+        )
+    )
+    controller.update()
+
+    controller.dispatch(Action.REFINE)
+    controller.dispatch(Action.SEND_DOWN)
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id, WorkerEventType.VOICE_COMPLETE, "@jbart", "refinement_voice"
+        )
+    )
+    controller.update()
+
+    assert controller.state is AppState.RECIPIENT_REVIEW
+    assert runner.lookup_calls == []
+    assert not HANDLE_STATES & set(controller.visited)

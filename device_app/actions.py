@@ -9,6 +9,7 @@ class Action(Enum):
     SEND_DOWN = auto()
     SEND_UP = auto()
     REFINE = auto()
+    HANDLE_MODE = auto()
     PREVIOUS = auto()
     NEXT = auto()
     SCROLL_UP = auto()

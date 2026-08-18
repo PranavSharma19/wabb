@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 
+import pytest
+
 from models.criteria import RecipientCriteria
 from mock_x_platform.dataset import build_dataset
 from mock_x_platform.dataset import TIER_NAMES
@@ -101,3 +103,27 @@ def test_evaluation_breaks_results_out_by_dirt_tier(tmp_path) -> None:
         rows = list(csv.DictReader(source))
     # Tier rides on every row so results can be joined back to the corpus.
     assert all(row["tier"] in TIER_NAMES for row in rows)
+
+
+def test_every_run_reports_what_it_would_have_cost(tmp_path) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.evaluation import run_evaluation
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=300, seed=42)
+
+    summary, _, _ = run_evaluation(
+        database,
+        output_directory=tmp_path / "reports",
+        case_limit=5,
+        determinism_cases=1,
+        run_http=False,
+    )
+
+    cost = summary["cost"]
+    # run_http=False is the common case in this suite, so a ledger hung off the
+    # HTTP layer would report $0.00 here -- a number that looks like a pass.
+    assert cost["distinct_profiles"] > 0
+    assert cost["estimated_usd"] > 0
+    assert cost["per_case_usd"] == pytest.approx(cost["estimated_usd"] / 5)
+    assert cost["rates_checked_on"]

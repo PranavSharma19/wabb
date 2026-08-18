@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from typing import Any
 
@@ -11,7 +13,15 @@ from .store import MockXStore
 
 OWNER_ID = "9000000"
 QUERY_PATTERN = re.compile(r"^[A-Za-z0-9_' ]{1,50}$")
-FAILURE_OPERATIONS = {"search", "send_dm", "list_dm"}
+# X's real limit is 15 characters, and `parse_handle` enforces it on the way in,
+# where a spoken handle is the thing being validated. This check is deliberately
+# looser: it guards against malformed input reaching the store, and the mock's
+# own generated corpus contains usernames like `isabella_rodriguez_4507` that
+# exceed 15. Re-asserting X's rule here would make the API refuse to resolve
+# profiles that exist in the fixture, which is the mock being pedantic about a
+# rule its own dataset breaks. See "What this plan deliberately does not do".
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,50}$")
+FAILURE_OPERATIONS = {"search", "lookup", "send_dm", "list_dm"}
 
 
 class MockXHttpError(RuntimeError):
@@ -35,6 +45,40 @@ class MockXHttpError(RuntimeError):
         }
 
 
+# X's real bounds. The default of 100 is deliberate: a caller that omits
+# max_results should reproduce the $1.00-per-search mistake here, in a harness
+# that reports it, rather than in production.
+DEFAULT_MAX_RESULTS = 100
+MAX_MAX_RESULTS = 1000
+
+
+def encode_cursor(query: str, offset: int) -> str:
+    """An opaque (query, offset) cursor, so callers cannot page by arithmetic."""
+
+    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+    raw = f"{digest}:{int(offset)}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(token: str, query: str) -> int:
+    """Read an offset back, refusing a cursor minted for a different query."""
+
+    padded = str(token) + "=" * (-len(str(token)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        digest, _, raw_offset = decoded.partition(":")
+        offset = int(raw_offset)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise MockXHttpError(
+            400, "next_token is not a valid pagination token", "Invalid next_token"
+        ) from exc
+    if offset < 0 or digest != hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]:
+        raise MockXHttpError(
+            400, "next_token does not belong to this query", "Invalid next_token"
+        )
+    return offset
+
+
 class MockXApplication:
     """Transport-independent X-like behavior used by the local HTTP server."""
 
@@ -45,14 +89,29 @@ class MockXApplication:
     def health(self) -> dict[str, Any]:
         return {"status": "ok", "service": "mock-x-platform", "owner_id": self.owner_id}
 
-    def search_users(self, query: str, max_results: int = 10) -> dict[str, Any]:
-        result, _ = self.search_users_with_diagnostics(query, max_results)
+    def search_users(
+        self,
+        query: str,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        next_token: str | None = None,
+    ) -> dict[str, Any]:
+        result, _ = self.search_users_with_diagnostics(query, max_results, next_token)
         return result
 
     def search_users_with_diagnostics(
-        self, query: str, max_results: int = 10
+        self,
+        query: str,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        next_token: str | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
-        """Run the real search path and expose preliminary IDs for offline evaluation."""
+        """Run the real search path and expose preliminary IDs for offline evaluation.
+
+        The IDs come back in relevance order, not pool-insertion order, since
+        pagination now slices the same relevance-sorted list the page itself is
+        drawn from. The one caller only tests these IDs for set membership, so
+        the ordering is not load-bearing there -- but a caller that started
+        relying on position would be relying on relevance, not the store.
+        """
 
         self._raise_injected_failure("search")
         if not QUERY_PATTERN.fullmatch(query or ""):
@@ -61,7 +120,8 @@ class MockXApplication:
                 "query must match [A-Za-z0-9_' ] and contain 1 to 50 characters",
                 "Invalid query",
             )
-        limit = min(max(int(max_results), 1), 10)
+        limit = min(max(int(max_results), 1), MAX_MAX_RESULTS)
+        offset = decode_cursor(next_token, query) if next_token else 0
         query_tokens = set(normalize_text(query).split())
 
         def relevance(profile: dict[str, object]) -> tuple[int, str]:
@@ -76,17 +136,72 @@ class MockXApplication:
             overlap = sum(token in searchable_tokens for token in query_tokens)
             return (-overlap, str(profile["id"]))
 
+        # The pool has to reach at least as deep as the page being served. The
+        # floor of 250 keeps the first page byte-identical to round 4's.
+        pool_limit = min(1000, max(250, offset + limit))
         source = (
-            self.store.search_profiles(query, limit=250)
+            self.store.search_profiles(query, limit=pool_limit)
             if self.store.profile_count()
             else MOCK_PROFILES
         )
-        profiles = sorted(source, key=relevance)[:limit]
-        result = {
-            "data": profiles,
-            "meta": {"result_count": len(profiles), "mock": True},
-        }
-        return result, [str(profile["id"]) for profile in source]
+        ordered = sorted(source, key=relevance)
+        profiles = ordered[offset : offset + limit]
+        # Billed here rather than in the store: the store hands back a candidate
+        # pool, and X charges for the resources the API returns.
+        self.store.ledger.record_search()
+        self.store.ledger.record_profiles(str(profile["id"]) for profile in profiles)
+        meta: dict[str, Any] = {"result_count": len(profiles), "mock": True}
+        # Two separate reasons to hand out a cursor, and only the first is
+        # obvious. The second: when the store filled the pool to its limit,
+        # `ordered` is a truncated view of the matches, not all of them --
+        # `len(ordered)` says where the pool stopped, not where the corpus did.
+        # Emitting no cursor there tells the caller it has seen everybody when
+        # the pool floor is what ran out. X hands back a next_token whose page
+        # can come up empty; that is the acceptable error, and silent
+        # truncation is not. The page slice itself is untouched, so which
+        # profiles appear on which page does not move.
+        pool_saturated = len(ordered) >= pool_limit
+        if profiles and (offset + limit < len(ordered) or pool_saturated):
+            meta["next_token"] = encode_cursor(query, offset + limit)
+        result = {"data": profiles, "meta": meta}
+        return result, [str(profile["id"]) for profile in ordered]
+
+    def lookup_user_by_username(self, username: str) -> dict[str, Any]:
+        """Resolve one profile by handle -- X's /2/users/by/username/:username.
+
+        A lookup, not a search: one profile in and one profile out, so it bills
+        one User where a ten-result search bills ten.
+        """
+
+        self._raise_injected_failure("lookup")
+        handle = str(username or "").strip().lstrip("@")
+        if not USERNAME_PATTERN.fullmatch(handle):
+            raise MockXHttpError(
+                400,
+                # 50, not X's 15, and the message has to say so: the bound
+                # named here is the bound USERNAME_PATTERN enforces. See the
+                # comment on USERNAME_PATTERN for why the mock is looser than X
+                # -- its own generated corpus contains handles X would reject,
+                # and a message promising 15 would send a reader hunting for a
+                # bug in a handle this endpoint resolves perfectly well.
+                "username must be 1 to 50 characters of letters, digits or underscore",
+                "Invalid username",
+            )
+        profile = self.store.get_profile_by_username(handle)
+        if profile is None:
+            profile = next(
+                (
+                    dict(item)
+                    for item in MOCK_PROFILES
+                    if str(item["username"]).casefold() == handle.casefold()
+                ),
+                None,
+            )
+        if profile is None:
+            raise MockXHttpError(404, f"User @{handle} was not found.", "User not found")
+        self.store.ledger.record_lookup()
+        self.store.ledger.record_profiles([str(profile["id"])])
+        return {"data": profile}
 
     def send_message(self, participant_id: str, text: str) -> dict[str, Any]:
         self._raise_injected_failure("send_dm")
@@ -107,6 +222,7 @@ class MockXApplication:
             recipient_id=str(participant_id),
             text=cleaned,
         )
+        self.store.ledger.record_dm_send()
         return {"data": message.to_dict()}
 
     def list_messages(self, participant_id: str) -> dict[str, Any]:

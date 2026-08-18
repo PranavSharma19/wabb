@@ -88,7 +88,20 @@ Device state and UI code depend only on this protocol:
 ```python
 class SearchProvider(Protocol):
     def search(self, criteria: RecipientCriteria) -> SearchResult: ...
+
+    def lookup(self, handle: str) -> SearchResult: ...
 ```
+
+Both methods are required. `lookup` is not optional and is not a fallback:
+pressing the handle button calls it directly (`jobs.WorkflowRunner
+._run_handle_lookup`), so a provider that implements only `search` raises
+`AttributeError` the first time a user enters a handle.
+
+`lookup` resolves exactly one account and returns zero or one candidate in the
+same `SearchResult` shape. An empty result means "no such account" — the device
+shows the not-found screen and offers the description path — and never means
+"search harder". It takes the bare handle, with or without a leading `@`; the
+provider strips it.
 
 `SearchResult` is serializable to this exact shape:
 
@@ -126,16 +139,27 @@ Rules:
   empty. `can_dm` may be `true`, `false`, or `null`. `score` is numeric.
 
 The current real-search code does not need to change to use the device. Pass its
-existing callable to `ExistingSearchAdapter`; the callable signature is:
+existing callables to `ExistingSearchAdapter`, which supplies both protocol
+methods on top of them:
 
 ```python
 def find_users(criteria: RecipientCriteria) -> list[models.candidate.Candidate]: ...
+
+def look_up_handle(handle: str) -> models.candidate.Candidate | None: ...
+
+provider = ExistingSearchAdapter(find_users, look_up_handle)
 ```
 
 The adapter caps the list at ten, converts domain candidates to schema v1, and
 adds the canonical `https://x.com/{username}` profile URL. Because the existing
 domain model has no explicit `company`, its bio is displayed when company is
 unavailable.
+
+The lookup callable is optional at construction. Omitting it keeps the adapter a
+valid `SearchProvider` — `lookup` still exists and still returns a
+`SearchResult` — but every handle then resolves to zero candidates, so the
+handle button always lands on the not-found screen. That is a deliberate
+degradation rather than a crash; supply the callable to make handle entry work.
 
 ## Tests
 

@@ -214,6 +214,10 @@ def run_evaluation(
         "profile_count": store.profile_count(),
         "case_count": len(cases),
         "search_count": len(rows),
+        # What this run would have cost on the real API. The HTTP load phase runs
+        # against its own store and its own ledger, so it is deliberately not
+        # counted here: it measures latency, not retrieval.
+        "cost": store.ledger.summary(case_count=len(cases)),
         "tier_counts": store.tier_counts(),
         "overall": overall_metrics,
         "variants": variant_metrics,
@@ -727,6 +731,20 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
             f"p95={metrics['latency_ms']['p95']:.1f}ms "
             f"throughput={metrics['throughput_requests_per_second']:.1f}/s"
         )
+
+    cost = summary["cost"]
+    print("\nEstimated cost on the real X API")
+    print(
+        f"  distinct profiles  {cost['distinct_profiles']:,}   "
+        f"windows={cost['billed_windows']}   searches={cost['searches']:,}   "
+        f"lookups={cost['lookups']:,}"
+    )
+    print(
+        f"  per case           ${cost['per_case_usd'] or 0:.4f}   "
+        f"(run total ${cost['estimated_usd']:,.2f}, {cost['scope']})"
+    )
+    print(f"  rates checked      {cost['rates_checked_on']} at ${cost['user_usd']:.3f}/user")
+
     calibration = summary["acceptance_calibration"]
     print(f"\nAcceptance: {'PASS' if summary['passed'] else 'FAIL'}  "
           f"({summary['corpus']} corpus thresholds)")

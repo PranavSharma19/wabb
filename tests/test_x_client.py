@@ -46,3 +46,32 @@ def test_x_client_sets_explicit_limit_fields_and_maps_response(monkeypatch) -> N
     assert len(results) == 10
     assert results[0].verified is True
     assert results[0].can_dm is True
+
+
+def test_lookup_username_returns_none_when_the_account_does_not_exist(monkeypatch) -> None:
+    class Response:
+        status_code = 404
+        ok = False
+        reason = "Not Found"
+        text = ""
+
+        def json(self):
+            return {"errors": [{"detail": "Not Found Error"}]}
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: Response())
+    assert XClient("token").lookup_username("nobodyhome") is None
+
+
+def test_lookup_username_returns_none_when_x_reports_errors_without_data(monkeypatch) -> None:
+    # X's other way of saying "no such account": 200, an errors array, no data.
+    class Response:
+        status_code = 200
+        ok = True
+        reason = "OK"
+        text = ""
+
+        def json(self):
+            return {"errors": [{"title": "Not Found Error"}]}
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: Response())
+    assert XClient("token").lookup_username("nobodyhome") is None

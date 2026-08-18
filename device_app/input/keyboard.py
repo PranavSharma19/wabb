@@ -17,6 +17,7 @@ class KeyboardInput:
             pygame.K_RETURN: Action.SEND_DOWN,
             pygame.K_KP_ENTER: Action.SEND_DOWN,
             pygame.K_r: Action.REFINE,
+            pygame.K_h: Action.HANDLE_MODE,
             pygame.K_LEFT: Action.PREVIOUS,
             pygame.K_RIGHT: Action.NEXT,
             pygame.K_UP: Action.SCROLL_UP,

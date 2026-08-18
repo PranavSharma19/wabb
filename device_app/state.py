@@ -8,7 +8,7 @@ from typing import Any
 
 from models.criteria import RecipientCriteria
 from models.direct_message import DirectMessage
-from parsing import RecipientParser, RuleBasedRecipientParser
+from parsing import RecipientParser, RuleBasedRecipientParser, parse_handle
 
 from .actions import Action
 from .events import WorkerEvent, WorkerEventType
@@ -31,6 +31,9 @@ class AppState(Enum):
     SENDING = auto()
     SUCCESS = auto()
     ERROR = auto()
+    HANDLE_RECORDING = auto()
+    HANDLE_LOOKUP = auto()
+    HANDLE_NOT_FOUND = auto()
 
     # Compatibility names retained for the earlier device milestone.
     RECIPIENT_RECORDING = RECORD_RECIPIENT
@@ -45,6 +48,7 @@ class SessionContext:
     transcript: str = ""
     criteria: RecipientCriteria = field(default_factory=RecipientCriteria)
     search_query: str = ""
+    handle: str = ""
     candidates: list[ProfileCandidate] = field(default_factory=list)
     selected_index: int = 0
     selected_candidate: ProfileCandidate | None = None
@@ -60,6 +64,7 @@ class SessionContext:
     recording_started_at: float | None = None
     recording_remaining: int = 0
     refinement_origin: AppState = AppState.RECIPIENT_REVIEW
+    handle_origin: AppState = AppState.HOME
     recoverable_error: str = ""
     error_operation: str = ""
     error_back_state: AppState = AppState.HOME
@@ -106,6 +111,9 @@ class DeviceController:
             AppState.SENDING: self._handle_sending,
             AppState.SUCCESS: self._handle_success,
             AppState.ERROR: self._handle_error,
+            AppState.HANDLE_RECORDING: self._handle_handle_recording,
+            AppState.HANDLE_LOOKUP: self._handle_handle_lookup,
+            AppState.HANDLE_NOT_FOUND: self._handle_handle_not_found,
         }
         handlers[self.state](action)
 
@@ -136,6 +144,14 @@ class DeviceController:
                 recording_remaining=int(self.record_limit_seconds)
             )
             self._start_voice("initial_voice", AppState.RECORD_RECIPIENT)
+        elif action is Action.HANDLE_MODE:
+            # The recipient screen's second record button. Which of the two the
+            # user pressed is the whole disambiguation.
+            self.context = SessionContext(
+                recording_remaining=int(self.record_limit_seconds)
+            )
+            self.context.handle_origin = AppState.HOME
+            self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
 
     def _handle_recipient_recording(self, action: Action) -> None:
         if action is Action.SEND_UP:
@@ -151,6 +167,7 @@ class DeviceController:
             "recipient_refinement": self.context.refinement_origin,
             "message_voice": AppState.RECORD_MESSAGE,
             "message_refinement": AppState.REVIEW_MESSAGE,
+            "handle_voice": self.context.handle_origin,
         }
         self._cancel_to(targets.get(self.context.current_operation, AppState.HOME))
 
@@ -185,6 +202,28 @@ class DeviceController:
         elif action is Action.BACK:
             self._cancel_to(AppState.RECIPIENT_REVIEW)
 
+    def _handle_handle_recording(self, action: Action) -> None:
+        if action is Action.SEND_UP:
+            self._finish_recording()
+        elif action in {Action.REFINE, Action.BACK}:
+            self._cancel_to(self.context.handle_origin)
+
+    def _handle_handle_lookup(self, action: Action) -> None:
+        if action in {Action.REFINE, Action.BACK}:
+            self._cancel_to(self.context.handle_origin)
+
+    def _handle_handle_not_found(self, action: Action) -> None:
+        # Both ways forward are offered explicitly. Picking one silently is what
+        # the detector design did wrong: the user asked for a specific account
+        # and deserves to be told it is not there.
+        if action is Action.SEND_DOWN:
+            self._start_voice("initial_voice", AppState.RECORD_RECIPIENT)
+        elif action is Action.HANDLE_MODE:
+            # A retry keeps the original origin -- leave handle_origin untouched.
+            self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
+        elif action is Action.BACK:
+            self._cancel_to(self.context.handle_origin)
+
     def _handle_profiles(self, action: Action) -> None:
         count = len(self.context.candidates)
         if action is Action.PREVIOUS and count:
@@ -200,6 +239,12 @@ class DeviceController:
         elif action is Action.REFINE:
             self.context.refinement_origin = AppState.SELECT_PROFILE
             self.state = AppState.REFINE_RECIPIENT
+        elif action is Action.HANDLE_MODE:
+            # The recovery path: the candidate list is not the person, and the
+            # user turns out to know the handle after all. The criteria are kept
+            # so BACK still returns to a populated review screen.
+            self.context.handle_origin = AppState.SELECT_PROFILE
+            self._start_voice("handle_voice", AppState.HANDLE_RECORDING)
         elif action is Action.SEND_DOWN and self.current_candidate is not None:
             self.context.selected_candidate = self.current_candidate
             self.context.message_transcript = ""
@@ -255,12 +300,15 @@ class DeviceController:
             self.context.recoverable_error = ""
             if operation == "search":
                 self._start_search()
+            elif operation == "handle_lookup" and self.context.handle:
+                self._start_handle_lookup(self.context.handle)
             elif operation == "send_message":
                 self._start_message()
             else:
                 states = {
                     "initial_voice": AppState.RECORD_RECIPIENT,
                     "recipient_refinement": AppState.REFINE_RECIPIENT,
+                    "handle_voice": AppState.HANDLE_RECORDING,
                     "message_voice": AppState.RECORD_MESSAGE,
                     "message_refinement": AppState.REFINE_MESSAGE,
                 }
@@ -290,6 +338,13 @@ class DeviceController:
         self.context.current_operation = "search"
         self.context.recoverable_error = ""
         self.state = AppState.SEARCHING
+
+    def _start_handle_lookup(self, handle: str) -> None:
+        operation_id = self.runner.start_handle_lookup(handle)
+        self.context.current_operation_id = operation_id
+        self.context.current_operation = "handle_lookup"
+        self.context.recoverable_error = ""
+        self.state = AppState.HANDLE_LOOKUP
 
     def _start_message(self) -> None:
         recipient = self.context.selected_candidate
@@ -322,6 +377,7 @@ class DeviceController:
                 AppState.REFINE_RECIPIENT,
                 AppState.RECORD_MESSAGE,
                 AppState.REFINE_MESSAGE,
+                AppState.HANDLE_RECORDING,
             }:
                 self.state = AppState.TRANSCRIBING
             return
@@ -329,7 +385,7 @@ class DeviceController:
             self._handle_voice_complete(event.operation, str(event.payload))
             return
         if event.type is WorkerEventType.SEARCH_COMPLETE:
-            self._handle_search_complete(event.payload)
+            self._handle_search_complete(event.payload, event.operation)
             return
         if event.type is WorkerEventType.MESSAGE_SENT:
             self.context.sent_message = event.payload
@@ -349,6 +405,15 @@ class DeviceController:
             self.context.selected_candidate = None
             self.context.criteria_scroll = 0
             self.state = AppState.RECIPIENT_REVIEW
+            return
+        if operation == "handle_voice":
+            self.context.transcript = transcript
+            handle = parse_handle(transcript)
+            self.context.handle = handle or ""
+            if handle is None:
+                self.state = AppState.HANDLE_NOT_FOUND
+                return
+            self._start_handle_lookup(handle)
             return
         if operation in {"recipient_refinement", "refinement_voice"}:
             self.context.transcript = (
@@ -378,7 +443,7 @@ class DeviceController:
         self.context.message_scroll = 0
         self.state = AppState.REVIEW_MESSAGE
 
-    def _handle_search_complete(self, payload: Any) -> None:
+    def _handle_search_complete(self, payload: Any, operation: str) -> None:
         if isinstance(payload, SearchResult):
             self.context.search_query = payload.query
             self.context.candidates = list(payload.candidates)
@@ -390,6 +455,9 @@ class DeviceController:
         self.context.selected_index = 0
         self.context.profile_scroll = 0
         self._clear_operation()
+        if operation == "handle_lookup" and not self.context.candidates:
+            self.state = AppState.HANDLE_NOT_FOUND
+            return
         self.state = AppState.SELECT_PROFILE
 
     def _handle_failure(self, event: WorkerEvent) -> None:
@@ -402,6 +470,8 @@ class DeviceController:
             "message_voice": AppState.RECORD_MESSAGE,
             "message_refinement": AppState.REVIEW_MESSAGE,
             "send_message": AppState.REVIEW_MESSAGE,
+            "handle_voice": self.context.handle_origin,
+            "handle_lookup": self.context.handle_origin,
         }
         self.context.error_back_state = back_states.get(event.operation, AppState.HOME)
         self._clear_operation()

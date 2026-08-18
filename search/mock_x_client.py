@@ -35,3 +35,15 @@ class MockXClient:
 
         scored.sort(key=lambda item: item[:2])
         return [Candidate.from_dict(profile) for _, _, profile in scored[:limit]]
+
+    def lookup_username(self, username: str) -> Candidate | None:
+        handle = str(username or "").strip().lstrip("@").casefold()
+        profile = next(
+            (
+                profile
+                for profile in MOCK_PROFILES
+                if str(profile.get("username", "")).casefold() == handle
+            ),
+            None,
+        )
+        return Candidate.from_dict(profile) if profile is not None else None

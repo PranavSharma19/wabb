@@ -26,7 +26,7 @@ def platform_client(tmp_path):
 def test_http_search_health_and_dm_round_trip(platform_client) -> None:
     assert platform_client.health()["status"] == "ok"
 
-    candidates = platform_client.search_users("John Doe XYZ Toronto", max_results=50)
+    candidates = platform_client.search_users("John Doe XYZ Toronto", max_results=10)
     assert len(candidates) == 10
     assert candidates[0].id == "1000001"
     assert candidates[0].can_dm is True
@@ -57,3 +57,59 @@ def test_http_reset_clears_persisted_messages(platform_client) -> None:
     platform_client.send_message("1000001", "Temporary")
     platform_client.reset()
     assert platform_client.list_messages("1000001") == []
+
+
+def test_http_handle_lookup_round_trip(platform_client) -> None:
+    candidate = platform_client.lookup_username("@johndoe_xyz")
+
+    assert candidate is not None
+    assert candidate.id == "1000001"
+
+
+def test_http_handle_lookup_returns_none_for_a_missing_account(platform_client) -> None:
+    assert platform_client.lookup_username("nobodyhome") is None
+
+
+def test_a_cursor_survives_the_http_round_trip(platform_client) -> None:
+    # The one path the application-layer pagination tests cannot reach: the
+    # cursor is minted by the server, crosses JSON and requests, and has to come
+    # back into decode_cursor intact on the second call.
+    first, token = platform_client.search_users_page("John Doe", max_results=5)
+    assert len(first) == 5
+    assert token
+
+    second, _ = platform_client.search_users_page(
+        "John Doe", max_results=5, next_token=token
+    )
+    assert len(second) == 5
+    assert not {item.id for item in first} & {item.id for item in second}
+
+
+def test_a_cursor_is_refused_for_a_different_query_over_http(platform_client) -> None:
+    _, token = platform_client.search_users_page("John Doe", max_results=5)
+
+    with pytest.raises(MockXPlatformError, match="400"):
+        platform_client.search_users_page("Maya Chen", max_results=5, next_token=token)
+
+
+def test_the_readme_endpoint_table_matches_the_routes_and_bounds() -> None:
+    # The table is the only place a reader learns what the mock exposes. It
+    # described /2/users/search as "capped at 10" -- our old cap, removed when
+    # the mock took X's real bounds -- and omitted the by-username route the
+    # handle path depends on entirely.
+    from pathlib import Path
+
+    from mock_x_platform.application import DEFAULT_MAX_RESULTS, MAX_MAX_RESULTS
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    table = readme.split("Implemented local routes:", 1)[1].split("\n\n", 2)[1]
+
+    assert "`GET /2/users/by/username/{username}`" in table
+    # Named bounds, not bare numbers: "100" is a substring of "1000", so a table
+    # that mentioned only the maximum satisfied `str(DEFAULT_MAX_RESULTS) in
+    # table` and the assertion could not fail for the default it claims to pin.
+    assert f"default {DEFAULT_MAX_RESULTS}" in table
+    assert f"maximum {MAX_MAX_RESULTS}" in table
+    assert "capped at 10" not in readme
