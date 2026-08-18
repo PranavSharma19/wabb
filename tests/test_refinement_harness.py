@@ -370,3 +370,106 @@ def test_reordering_the_same_ten_is_not_a_re_retrieval() -> None:
         previous_ids=["1", "2", "3"],
     )
     assert swapped["retrieval_changed"] is True
+
+
+def _unreachable_store(tmp_path):
+    """One case whose account shares no token with the name the sender has."""
+
+    store = _store(tmp_path, description="", location="")
+    store.replace_profiles(
+        [
+            {
+                "id": "9001",
+                "name": "jbart",
+                "username": "jbart",
+                "description": "",
+                "location": "",
+                "profile_image_url": "",
+                "verified": False,
+                "receives_your_dm": True,
+                "tier": "handle_name",
+                "follower_count": 10,
+            }
+        ]
+    )
+    return store
+
+
+def test_the_handle_turn_does_not_inflate_a_by_index_bucket(tmp_path) -> None:
+    # The handle turn is the last turn of every case and is 100% visible by
+    # construction. Bucketing it by turn_index puts a guaranteed hit into
+    # whichever index it happens to land in, so the by-index series stops being
+    # a picture of search refinement and becomes a picture of ladder length.
+    from mock_x_platform.refinement import run_refinement
+
+    store = _unreachable_store(tmp_path)
+
+    summary, _, _ = run_refinement(store.path, output_directory=tmp_path / "reports")
+
+    # Search never put this person on screen at any turn...
+    assert summary["convergence"]["rate"] == 0.0
+    assert {metrics["visible"] for metrics in summary["by_turn_index"].values()} == {0.0}
+    # ...and the handle turn is still reported, on its own, by type.
+    assert summary["by_turn_type"]["handle"]["visible"] == 1.0
+    assert summary["by_turn_type"]["handle"]["turns"] == 1
+
+
+def test_by_turn_index_counts_every_search_turn_and_no_handle_turn(tmp_path) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+
+    summary, _, _ = run_refinement(
+        database, output_directory=tmp_path / "reports", case_limit=25
+    )
+
+    handle_turns = summary["by_turn_type"]["handle"]["turns"]
+    assert handle_turns == summary["case_count"]
+    indexed = sum(metrics["turns"] for metrics in summary["by_turn_index"].values())
+    # Every row except the handle rows: turn 0 for each case, plus every
+    # refinement turn, minus the one handle turn each case ends on.
+    assert indexed == summary["case_count"] + summary["turn_count"] - handle_turns
+
+
+def test_the_run_reports_profiles_purchased_per_convergence(tmp_path) -> None:
+    # Spec 4 names profiles purchased per convergence as a primary metric: the
+    # per-case figure divides by cases that never converged as well, so it
+    # cannot answer "what does one found person cost".
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+
+    summary, _, _ = run_refinement(
+        database, output_directory=tmp_path / "reports", case_limit=25
+    )
+    convergence = summary["convergence"]
+
+    per_case = convergence["marginal_profiles_purchased_per_case"]
+    per_convergence = convergence["marginal_profiles_purchased_per_convergence"]
+    converged = round(convergence["rate"] * summary["case_count"])
+    assert converged > 0
+    assert per_convergence == pytest.approx(
+        per_case * summary["case_count"] / converged, rel=1e-3
+    )
+    # The per-case key stays: it is the one that divides by the whole run.
+    assert per_case > 0
+
+
+def test_profiles_purchased_per_convergence_is_none_when_nothing_converged(
+    tmp_path,
+) -> None:
+    # Not 0.0. Zero purchases per convergence would read as "free", where the
+    # truth is that the denominator does not exist.
+    from mock_x_platform.refinement import run_refinement
+
+    store = _unreachable_store(tmp_path)
+
+    summary, _, _ = run_refinement(store.path, output_directory=tmp_path / "reports")
+
+    assert summary["convergence"]["rate"] == 0.0
+    assert summary["convergence"]["marginal_profiles_purchased_per_convergence"] is None
+    assert summary["convergence"]["marginal_profiles_purchased_per_case"] > 0

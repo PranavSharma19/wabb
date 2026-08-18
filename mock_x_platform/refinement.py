@@ -406,9 +406,18 @@ def _summarize(
         )
         for turn_type in TURN_TYPES
     }
-    indexes = sorted({row["turn_index"] for row in rows})
+    # Search turns only. The handle turn is the last turn of every case and is
+    # 100% visible by construction, so bucketing it by index drops a guaranteed
+    # hit into whichever index that case's ladder happened to end on -- the
+    # by-index series then reports ladder length rather than whether saying more
+    # about a person brings them onto the screen. It is reported on its own,
+    # unchanged, in `by_turn_type`.
+    search_rows = [row for row in rows if row["turn_type"] != "handle"]
+    indexes = sorted({row["turn_index"] for row in search_rows})
     by_index = {
-        str(index): _turn_metrics([row for row in rows if row["turn_index"] == index])
+        str(index): _turn_metrics(
+            [row for row in search_rows if row["turn_index"] == index]
+        )
         for index in indexes
     }
     converged = [item for item in per_case if item["converged_by_search"]]
@@ -446,6 +455,16 @@ def _summarize(
             # measured. See the same caveat on the "cost" block below.
             "marginal_profiles_purchased_per_case": (
                 round(sum(purchased) / len(purchased), 4) if purchased else 0.0
+            ),
+            # Spec 4's primary metric: what one *found* person costs. The
+            # per-case figure above divides by cases that never converged too,
+            # so it answers a different question and both are kept. Same
+            # marginal caveat as above -- the numerator is the whole run's
+            # deduplicated purchases, not a per-session bill. None rather than
+            # 0.0 when nothing converged: zero purchases per convergence would
+            # read as "free", where the truth is the denominator does not exist.
+            "marginal_profiles_purchased_per_convergence": (
+                round(sum(purchased) / len(converged), 4) if converged else None
             ),
         },
         "cost": store.ledger.summary(case_count=len(cases)),
@@ -522,9 +541,15 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
         f"   marginal profiles/case: "
         f"{convergence['marginal_profiles_purchased_per_case']:.1f}"
     )
+    per_convergence = convergence["marginal_profiles_purchased_per_convergence"]
     print(
         f"  unconvergeable          {convergence['structurally_unconvergeable']:.1%}"
         f"   ({convergence['unconvergeable_cases']:,} cases reachable only by handle)"
+    )
+    print(
+        "  marginal profiles/convergence: "
+        f"{'n/a' if per_convergence is None else f'{per_convergence:.1f}'}"
+        "   (purchases over converged cases; marginal, not per-session)"
     )
     cost = summary["cost"]
     print(
