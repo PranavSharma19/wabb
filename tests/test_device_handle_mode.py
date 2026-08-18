@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from models.criteria import RecipientCriteria
 
 from device_app.actions import Action
@@ -158,3 +160,106 @@ def test_a_not_found_handle_returns_to_the_candidate_list_it_came_from() -> None
     controller.dispatch(Action.BACK)
     assert controller.state is AppState.SELECT_PROFILE
     assert controller.context.criteria.name == "Joe Bart"
+
+
+class RecordingController(DeviceController):
+    """A controller that remembers every state it ever entered.
+
+    Asserting on `controller.state` after each call only samples the states the
+    test happens to look at. Mode isolation is a claim about every state on the
+    path, including ones a transition passes straight through, so the assignment
+    itself is what gets recorded.
+    """
+
+    def __init__(self, runner: HandleRunner) -> None:
+        self.visited: list[AppState] = []
+        super().__init__(runner)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "state":
+            self.visited.append(value)  # type: ignore[arg-type]
+        super().__setattr__(name, value)
+
+
+HANDLE_STATES = {
+    AppState.HANDLE_RECORDING,
+    AppState.HANDLE_LOOKUP,
+    AppState.HANDLE_NOT_FOUND,
+}
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "at meta",
+        "@meta",
+        "message at meta",
+        "his handle is jbart",
+    ],
+)
+def test_a_description_that_looks_like_a_handle_still_goes_to_search(
+    transcript: str,
+) -> None:
+    # The other direction of mode isolation, and the one that makes "message at
+    # Meta" safe. Handle entry is an explicit mode rather than a detector
+    # precisely so that a description can never be mistaken for a handle -- but
+    # only the handle-never-searches half was pinned, so a detector could have
+    # been reintroduced on the description path without a single test failing.
+    runner = HandleRunner()
+    controller = RecordingController(runner)
+
+    controller.dispatch(Action.SEND_DOWN)
+    assert controller.state is AppState.RECORD_RECIPIENT
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id, WorkerEventType.VOICE_COMPLETE, transcript, "initial_voice"
+        )
+    )
+    controller.update()
+
+    assert controller.state is AppState.RECIPIENT_REVIEW
+    controller.dispatch(Action.SEND_DOWN)
+
+    assert controller.state is AppState.SEARCHING
+    assert len(runner.search_calls) == 1
+    assert runner.lookup_calls == []
+    # No handle recording was ever started either -- the mode is entered only by
+    # Action.HANDLE_MODE, which nothing on this path dispatches.
+    assert runner.voice_calls == ["initial_voice"]
+    assert not HANDLE_STATES & set(controller.visited)
+
+
+def test_a_spoken_refinement_that_looks_like_a_handle_still_refines() -> None:
+    runner = HandleRunner()
+    controller = RecordingController(runner)
+    controller.dispatch(Action.SEND_DOWN)
+    operation_id = controller.context.current_operation_id
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id,
+            WorkerEventType.VOICE_COMPLETE,
+            "Joe Bart at Meta",
+            "initial_voice",
+        )
+    )
+    controller.update()
+
+    controller.dispatch(Action.REFINE)
+    controller.dispatch(Action.SEND_DOWN)
+    operation_id = controller.context.current_operation_id
+    assert operation_id is not None
+    controller.dispatch(Action.SEND_UP)
+    runner.emit(
+        WorkerEvent(
+            operation_id, WorkerEventType.VOICE_COMPLETE, "@jbart", "refinement_voice"
+        )
+    )
+    controller.update()
+
+    assert controller.state is AppState.RECIPIENT_REVIEW
+    assert runner.lookup_calls == []
+    assert not HANDLE_STATES & set(controller.visited)
