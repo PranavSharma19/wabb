@@ -272,3 +272,45 @@ def test_the_username_rejection_message_names_the_bound_it_enforces(
     assert error.value.status == 400
     assert "1 to 50" in error.value.detail
     assert "15" not in error.value.detail
+
+
+def test_a_saturated_pool_never_reports_end_of_results(app: MockXApplication) -> None:
+    # 1,100 people match, but the candidate pool bottoms out at 250 when the
+    # page asks for 250 or fewer. Reading "no next_token" as "no more results"
+    # is then a lie told by the pool floor, not by the corpus: the caller is
+    # told it has seen everybody when it has seen fewer than a quarter of them.
+    _crowd(app.store, 1_100)
+
+    page = app.search_users("John Doe", max_results=250)
+
+    assert len(page["data"]) == 250
+    assert "next_token" in page["meta"]
+
+
+def test_the_page_after_a_saturated_pool_returns_the_rows_it_hid(
+    app: MockXApplication,
+) -> None:
+    _crowd(app.store, 1_100)
+
+    first = app.search_users("John Doe", max_results=250)
+    second = app.search_users(
+        "John Doe", max_results=250, next_token=first["meta"]["next_token"]
+    )
+
+    first_ids = [profile["id"] for profile in first["data"]]
+    second_ids = [profile["id"] for profile in second["data"]]
+    assert len(second_ids) == 250
+    assert not set(first_ids) & set(second_ids)
+
+
+def test_an_exhausted_pool_still_stops(app: MockXApplication) -> None:
+    # The other half of the contract. X will hand out a next_token whose page
+    # comes back empty, so an over-eager token is acceptable -- but a token on
+    # a page that already ran out is a paging loop, and the caller has no way
+    # to tell the difference from the outside.
+    _crowd(app.store, 300)
+
+    last = app.search_users("John Doe", max_results=1_000)
+
+    assert len(last["data"]) == 300
+    assert "next_token" not in last["meta"]

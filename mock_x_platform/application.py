@@ -151,7 +151,17 @@ class MockXApplication:
         self.store.ledger.record_search()
         self.store.ledger.record_profiles(str(profile["id"]) for profile in profiles)
         meta: dict[str, Any] = {"result_count": len(profiles), "mock": True}
-        if offset + limit < len(ordered):
+        # Two separate reasons to hand out a cursor, and only the first is
+        # obvious. The second: when the store filled the pool to its limit,
+        # `ordered` is a truncated view of the matches, not all of them --
+        # `len(ordered)` says where the pool stopped, not where the corpus did.
+        # Emitting no cursor there tells the caller it has seen everybody when
+        # the pool floor is what ran out. X hands back a next_token whose page
+        # can come up empty; that is the acceptable error, and silent
+        # truncation is not. The page slice itself is untouched, so which
+        # profiles appear on which page does not move.
+        pool_saturated = len(ordered) >= pool_limit
+        if profiles and (offset + limit < len(ordered) or pool_saturated):
             meta["next_token"] = encode_cursor(query, offset + limit)
         result = {"data": profiles, "meta": meta}
         return result, [str(profile["id"]) for profile in ordered]
