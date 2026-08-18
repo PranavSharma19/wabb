@@ -70,7 +70,7 @@ python main.py
 
 This launches the original terminal interface. Use `python -m device_app` for the handheld UI.
 
-`MOCK_X=true` is the default, even if no `.env` exists. No network call or X credential is used in this mode. The mock source contains 12 deliberately similar profiles and returns at most 10 per search.
+`MOCK_X=true` is the default, even if no `.env` exists. No network call or X credential is used in this mode. The mock source contains 12 deliberately similar profiles, and the client asks for at most 10 per search.
 
 Try:
 
@@ -118,7 +118,8 @@ Implemented local routes:
 | Route | Purpose |
 |---|---|
 | `GET /health` | Service readiness |
-| `GET /2/users/search` | X-shaped user search, capped at 10 |
+| `GET /2/users/search` | X-shaped user search. `max_results` follows X: minimum 1, default 100, maximum 1000, with `next_token` paging |
+| `GET /2/users/by/username/{username}` | Resolve one profile by handle (the device's handle path) |
 | `POST /2/dm_conversations/with/{id}/messages` | Send a fake one-to-one DM |
 | `GET /2/dm_conversations/with/{id}/dm_events` | Read that fake conversation |
 | `GET /__mock__/messages` | Inspect all stored fake messages |
@@ -144,7 +145,7 @@ python -m mock_x_platform.dataset
 
 Restart `python -m mock_x_platform` afterward. The generator uses a fixed seed and includes the original ambiguous John Doe profiles plus broad synthetic variation across names, companies, roles, schools, locations, verification, and DM eligibility. It also stores 1,000 deterministic ground-truth cases pairing natural-language descriptions and structured criteria with the expected profile ID. Re-running the command replaces the generated profiles and evaluation cases while preserving fake messages.
 
-Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index over name and username, the two fields X's `/2/users/search` actually matches. Each search first retrieves at most 250 plausible profiles, applies deterministic mock relevance, and returns at most 10 for the application's detailed criteria ranker. This avoids scanning and sorting all 100,000 profiles per request.
+Profiles live in SQLite alongside fake DM data and are retrieved through an FTS5 index over name and username, the two fields X's `/2/users/search` actually matches. Each search first retrieves a candidate pool -- at least 250 profiles, and as deep as the page being served -- then applies deterministic mock relevance and cuts the requested page from it. This avoids scanning and sorting all 100,000 profiles per request. The ten-result page the criteria ranker sees is the *client's* doing, not the mock's: `XClient` and `MockXClient` both send `max_results=10` deliberately, while the mock itself will serve up to 1000 and defaults to 100 when the parameter is omitted. Keeping those two apart is the point -- the mock reproduces X's real bounds so that omitting `max_results` costs what it would cost in production, and the client's ten is a separate, deliberate choice about what the device asks for.
 
 Profiles matching every query token lead the pool, followed by profiles matching any token; the full-query match is a ranking preference, not a filter. Indexing the bio and location was removed deliberately: document lengths then ranged from 3 to 24 tokens, and because bm25 divides by document length, sparse profiles floated to the top of the 250-row pool while rich profiles fell off the end of it — retrieval was being filtered by how complete a profile was.
 
@@ -290,7 +291,7 @@ This implementation follows X's current [User Search documentation](https://docs
 GET https://api.x.com/2/users/search
 ```
 
-It always sends `max_results=10`; X's [endpoint reference](https://docs.x.com/x-api/users/search-users) documents a much larger default, so the application never relies on that default. It requests:
+It always sends `max_results=10`; X's [endpoint reference](https://docs.x.com/x-api/users/search-users) documents a default of 100 and a maximum of 1000, so the application never relies on that default. The local mock implements those real bounds (see the route table above); the client's ten is what the device asks for, against either backend. It requests:
 
 ```text
 id,name,username,description,location,profile_image_url,

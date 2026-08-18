@@ -68,3 +68,29 @@ def test_existing_finder_adapter_converts_domain_candidates() -> None:
     assert result.query == "Maya Chen"
     assert result.candidates[0].id == "x-1"
     assert result.candidates[0].profile_url == "https://x.com/maya"
+
+
+def test_the_readme_documents_every_method_the_protocol_requires() -> None:
+    # A provider written from the README is a provider the device calls lookup()
+    # on the moment the user presses the handle button (jobs.WorkflowRunner
+    # ._run_handle_lookup). A README that documents only search() therefore
+    # ships an AttributeError to anyone who follows it.
+    import re
+    from pathlib import Path
+
+    from device_app.search_contract import SearchProvider
+
+    required = {name for name in vars(SearchProvider) if not name.startswith("_")}
+    assert required == {"search", "lookup"}
+
+    readme = (
+        Path(__file__).resolve().parents[1] / "device_app" / "README.md"
+    ).read_text(encoding="utf-8")
+    documented = next(
+        block
+        for block in re.findall(r"```python\n(.*?)```", readme, re.DOTALL)
+        if "class SearchProvider(Protocol)" in block
+    )
+
+    for name in sorted(required):
+        assert f"def {name}(" in documented, f"README omits SearchProvider.{name}"

@@ -90,3 +90,23 @@ def test_a_cursor_is_refused_for_a_different_query_over_http(platform_client) ->
 
     with pytest.raises(MockXPlatformError, match="400"):
         platform_client.search_users_page("Maya Chen", max_results=5, next_token=token)
+
+
+def test_the_readme_endpoint_table_matches_the_routes_and_bounds() -> None:
+    # The table is the only place a reader learns what the mock exposes. It
+    # described /2/users/search as "capped at 10" -- our old cap, removed when
+    # the mock took X's real bounds -- and omitted the by-username route the
+    # handle path depends on entirely.
+    from pathlib import Path
+
+    from mock_x_platform.application import DEFAULT_MAX_RESULTS, MAX_MAX_RESULTS
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    table = readme.split("Implemented local routes:", 1)[1].split("\n\n", 2)[1]
+
+    assert "`GET /2/users/by/username/{username}`" in table
+    assert str(DEFAULT_MAX_RESULTS) in table
+    assert str(MAX_MAX_RESULTS) in table
+    assert "capped at 10" not in readme
