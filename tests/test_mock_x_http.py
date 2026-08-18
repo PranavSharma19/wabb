@@ -107,6 +107,9 @@ def test_the_readme_endpoint_table_matches_the_routes_and_bounds() -> None:
     table = readme.split("Implemented local routes:", 1)[1].split("\n\n", 2)[1]
 
     assert "`GET /2/users/by/username/{username}`" in table
-    assert str(DEFAULT_MAX_RESULTS) in table
-    assert str(MAX_MAX_RESULTS) in table
+    # Named bounds, not bare numbers: "100" is a substring of "1000", so a table
+    # that mentioned only the maximum satisfied `str(DEFAULT_MAX_RESULTS) in
+    # table` and the assertion could not fail for the default it claims to pin.
+    assert f"default {DEFAULT_MAX_RESULTS}" in table
+    assert f"maximum {MAX_MAX_RESULTS}" in table
     assert "capped at 10" not in readme

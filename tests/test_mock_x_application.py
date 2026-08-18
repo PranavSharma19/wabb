@@ -303,6 +303,30 @@ def test_the_page_after_a_saturated_pool_returns_the_rows_it_hid(
     assert not set(first_ids) & set(second_ids)
 
 
+def test_a_page_past_the_pool_ceiling_stops_rather_than_looping(
+    app: MockXApplication,
+) -> None:
+    # The `profiles and` half of the cursor rule, which nothing else reaches.
+    # `test_an_exhausted_pool_still_stops` runs against a corpus whose pool never
+    # saturates, so it exercises the other branch: drop the emptiness guard and
+    # that test stays green while this walk never terminates. At the hard 1,000
+    # pool ceiling both conditions fire at once -- the pool is saturated AND the
+    # page past it is empty -- and only the guard tells them apart. An empty page
+    # that keeps handing out cursors is a paging loop the caller cannot detect
+    # from the outside.
+    _crowd(app.store, 1_100)
+
+    first = app.search_users("John Doe", max_results=1_000)
+    past_the_ceiling = app.search_users(
+        "John Doe", max_results=1_000, next_token=first["meta"]["next_token"]
+    )
+
+    assert len(first["data"]) == 1_000
+    assert past_the_ceiling["data"] == []
+    assert past_the_ceiling["meta"]["result_count"] == 0
+    assert "next_token" not in past_the_ceiling["meta"]
+
+
 def test_an_exhausted_pool_still_stops(app: MockXApplication) -> None:
     # The other half of the contract. X will hand out a next_token whose page
     # comes back empty, so an over-eager token is acceptable -- but a token on
