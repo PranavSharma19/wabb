@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import time
@@ -29,6 +30,27 @@ from .store import MATCH_SCOPES, RESULT_ORDERS, MockXStore
 
 
 TURN_TYPES = ("on_profile", "off_profile", "narrowing_name", "handle")
+
+# Stamping `match_scope` and `result_order` into a report says which store
+# settings produced it. It does not, on its own, make a second run under a
+# different setting an independent measurement, and two of this harness's
+# reports have been observed to be bit-identical across the whole `result_order`
+# sweep. `observation_digest` is what settles it from the output alone.
+FLAG_SENSITIVITY_NOTE = (
+    "`observation_digest` fingerprints every row this run observed: the "
+    "(case_id, turn_index, rank, visible, retrieval_changed) tuple of each turn. "
+    "Two reports that share a digest saw the same people at the same ranks on "
+    "every turn, so the flag that differs between them was INERT for this "
+    "corpus and quoting them as two results is quoting one measurement twice. "
+    "Expect that outcome: (1) MockXApplication re-sorts the store's candidate "
+    "pool by (-overlap, id) before cutting the page, and every profile matching "
+    "all the query's tokens ties on overlap, so either result_order collapses "
+    "to 'AND-matches by ascending id'; (2) build_search_query is name-only, so "
+    "no query ever carries a bio term and the name_username_bio index is never "
+    "consulted. Compare digests before treating a flag as a sensitivity check. "
+    "`python -m mock_x_platform.refinement --scope both --order both` runs every "
+    "combination and prints which flags moved nothing."
+)
 
 # The clues a sender adds after leading with a name and a company, in the order
 # they are shuffled into each ladder.
@@ -429,6 +451,11 @@ def _summarize(
         "database": str(database.resolve()),
         "match_scope": match_scope,
         "result_order": result_order,
+        # The two keys above name the settings; this one names the result. See
+        # FLAG_SENSITIVITY_NOTE -- without it a reader has no way to tell a
+        # sensitivity check from the same measurement filed twice.
+        "observation_digest": _observation_digest(rows),
+        "flag_sensitivity": FLAG_SENSITIVITY_NOTE,
         "seed": seed,
         "case_count": len(cases),
         "turn_count": len(refinement_rows),
@@ -502,6 +529,35 @@ def _turn_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _observation_digest(rows: list[dict[str, Any]]) -> str:
+    """A stable fingerprint of everything a run actually observed.
+
+    Deliberately narrow. It covers what was seen -- which case, which turn,
+    where the target landed, whether it was on screen, whether the retrieved set
+    moved -- and nothing about when the run happened, how long it took or which
+    flags were asked for. Two runs under different flags therefore produce the
+    same digest exactly when the flag changed nothing that this harness measures,
+    which is the question `match_scope` and `result_order` in the report header
+    look like they answer and do not.
+    """
+
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(
+            "\x1f".join(
+                (
+                    str(row["case_id"]),
+                    str(row["turn_index"]),
+                    "-" if row["rank"] is None else str(row["rank"]),
+                    "1" if row["visible"] else "0",
+                    "1" if row["retrieval_changed"] else "0",
+                )
+            ).encode("utf-8")
+        )
+        digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
 def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 6) if denominator else 0.0
 
@@ -556,6 +612,11 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
         f"  estimated cost          ${cost['per_case_usd'] or 0:.4f}/case"
         f"   (run total ${cost['estimated_usd']:,.2f})"
     )
+    print(
+        f"  observation digest      {summary['observation_digest'][:16]}"
+        "   (same digest as another run = same rows, same ranks: that flag was"
+        " inert, not a second measurement)"
+    )
     print(f"JSON report: {json_path}")
     print(f"CSV detail: {csv_path}")
 
@@ -582,9 +643,10 @@ def main() -> int:
     args = parser.parse_args()
     scopes = list(MATCH_SCOPES) if args.scope == "both" else [args.scope]
     orders = list(RESULT_ORDERS) if args.order == "both" else [args.order]
+    digests: dict[tuple[str, str], str] = {}
     for scope in scopes:
         for order in orders:
-            run_refinement(
+            summary, _, _ = run_refinement(
                 args.database,
                 output_directory=args.output,
                 case_limit=args.limit,
@@ -592,7 +654,52 @@ def main() -> int:
                 result_order=order,
                 seed=args.seed,
             )
+            digests[(scope, order)] = summary["observation_digest"]
+    print(_flag_sensitivity_line(digests, scopes, orders))
     return 0
+
+
+def _flag_sensitivity_line(
+    digests: dict[tuple[str, str], str], scopes: list[str], orders: list[str]
+) -> str:
+    """Say which of the swept flags moved nothing, from the digests just produced.
+
+    The sweep is the only place that has every combination in hand, so it is the
+    only place that can answer this without a human diffing report files. A flag
+    counts as inert when changing it leaves the digest identical at every setting
+    of the other flag -- not merely at one of them.
+    """
+
+    swept = [
+        name
+        for name, values in (("match_scope", scopes), ("result_order", orders))
+        if len(values) > 1
+    ]
+    if not swept:
+        return (
+            "\nFlag sensitivity: one combination run, so nothing to compare. "
+            "Sweep --scope both --order both to find out whether either flag "
+            "moves anything on this corpus."
+        )
+    inert = []
+    if len(scopes) > 1 and all(
+        len({digests[(scope, order)] for scope in scopes}) == 1 for order in orders
+    ):
+        inert.append("match_scope")
+    if len(orders) > 1 and all(
+        len({digests[(scope, order)] for order in orders}) == 1 for scope in scopes
+    ):
+        inert.append("result_order")
+    moved = [name for name in swept if name not in inert]
+    parts = []
+    if inert:
+        parts.append(
+            f"{' and '.join(inert)} inert -- identical observation_digest at every "
+            "setting, so those reports are one measurement, not several"
+        )
+    if moved:
+        parts.append(f"{' and '.join(moved)} moved the observed rows")
+    return f"\nFlag sensitivity: {'; '.join(parts)}."
 
 
 if __name__ == "__main__":

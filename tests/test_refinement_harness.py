@@ -473,3 +473,148 @@ def test_profiles_purchased_per_convergence_is_none_when_nothing_converged(
     assert summary["convergence"]["rate"] == 0.0
     assert summary["convergence"]["marginal_profiles_purchased_per_convergence"] is None
     assert summary["convergence"]["marginal_profiles_purchased_per_case"] > 0
+
+
+def test_the_report_fingerprints_the_rows_it_observed(tmp_path) -> None:
+    # `match_scope` and `result_order` in the header name the settings a run
+    # used. They say nothing about whether the settings changed the answer, and
+    # a reader who sees two reports with different headers will assume they are
+    # two measurements. The digest is what lets the output itself settle that.
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+    reports = tmp_path / "reports"
+
+    first, _, _ = run_refinement(database, output_directory=reports, case_limit=25)
+    again, _, _ = run_refinement(database, output_directory=reports, case_limit=25)
+    fewer, _, _ = run_refinement(database, output_directory=reports, case_limit=10)
+
+    assert len(first["observation_digest"]) == 64
+    # Same observations, same digest -- it must not pick up the clock or the run
+    # duration, or every run would look different from every other run.
+    assert first["observation_digest"] == again["observation_digest"]
+    # Different observations, different digest -- otherwise it proves nothing.
+    assert first["observation_digest"] != fewer["observation_digest"]
+
+
+def test_two_flag_settings_that_measure_the_same_thing_share_a_digest(tmp_path) -> None:
+    # The finding this mechanism exists to expose. Every profile matching all of
+    # a query's tokens ties on overlap, and MockXApplication re-sorts the pool by
+    # (-overlap, id) before cutting the page, so either result_order collapses to
+    # the same page; and build_search_query is name-only, so the bio index is
+    # never consulted. Both flags are therefore inert here, and four reports that
+    # look like a sensitivity sweep are one measurement filed four times.
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import run_refinement
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=3_000, seed=42)
+    reports = tmp_path / "reports"
+
+    digests = {
+        (scope, order): run_refinement(
+            database,
+            output_directory=reports,
+            case_limit=25,
+            match_scope=scope,
+            result_order=order,
+        )[0]["observation_digest"]
+        for scope in ("name_username", "name_username_bio")
+        for order in ("bm25", "follower_weighted")
+    }
+
+    assert len(set(digests.values())) == 1
+
+
+def test_the_report_explains_what_a_shared_digest_means(tmp_path) -> None:
+    # A reader of one JSON file, with no access to this test suite, has to be
+    # able to reach the right conclusion.
+    from mock_x_platform.refinement import run_refinement
+
+    store = _unreachable_store(tmp_path)
+
+    summary, json_path, _ = run_refinement(
+        store.path, output_directory=tmp_path / "reports"
+    )
+    written = json.loads(json_path.read_text(encoding="utf-8"))
+
+    note = summary["flag_sensitivity"]
+    assert written["flag_sensitivity"] == note
+    assert written["observation_digest"] == summary["observation_digest"]
+    assert "observation_digest" in note
+    # The mechanism, not just the rule: overlap ties and the name-only query are
+    # why a reader should expect the flags to be inert rather than suspect a bug.
+    assert "overlap" in note
+    assert "build_search_query" in note
+
+
+def test_the_sweep_names_the_flags_that_moved_nothing(tmp_path, capsys) -> None:
+    from mock_x_platform.dataset import build_dataset
+    from mock_x_platform.refinement import main
+
+    database = tmp_path / "profiles.sqlite3"
+    build_dataset(database, count=1_500, seed=42)
+
+    argv = [
+        "--database",
+        str(database),
+        "--output",
+        str(tmp_path / "reports"),
+        "--limit",
+        "6",
+        "--scope",
+        "both",
+        "--order",
+        "both",
+    ]
+    import sys
+
+    original, sys.argv = sys.argv, ["refinement", *argv]
+    try:
+        assert main() == 0
+    finally:
+        sys.argv = original
+
+    printed = capsys.readouterr().out
+    line = next(
+        text for text in printed.splitlines() if text.startswith("Flag sensitivity:")
+    )
+    assert "match_scope" in line
+    assert "result_order" in line
+    assert "inert" in line
+    assert "moved" not in line
+
+
+def test_the_sweep_line_separates_an_inert_flag_from_one_that_moved() -> None:
+    # The corpus cannot currently produce a flag that moves anything, so the
+    # other branch of the sweep's verdict is pinned directly. Without this, a
+    # line that said "inert" unconditionally would pass every other test here.
+    from mock_x_platform.refinement import _flag_sensitivity_line
+
+    scopes = ["name_username", "name_username_bio"]
+    orders = ["bm25", "follower_weighted"]
+    line = _flag_sensitivity_line(
+        {
+            ("name_username", "bm25"): "aaa",
+            ("name_username", "follower_weighted"): "bbb",
+            ("name_username_bio", "bm25"): "aaa",
+            ("name_username_bio", "follower_weighted"): "bbb",
+        },
+        scopes,
+        orders,
+    )
+
+    assert "match_scope inert" in line
+    assert "result_order moved the observed rows" in line
+
+
+def test_a_single_combination_run_says_it_has_nothing_to_compare() -> None:
+    from mock_x_platform.refinement import _flag_sensitivity_line
+
+    line = _flag_sensitivity_line(
+        {("name_username", "bm25"): "aaa"}, ["name_username"], ["bm25"]
+    )
+
+    assert "nothing to compare" in line
