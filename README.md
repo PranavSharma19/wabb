@@ -201,6 +201,46 @@ Clean and dirty corpora get separate threshold sets, selected automatically from
 
 Every check records, in `catches`, the specific regression it exists to detect; the printed summary shows it for any check that fails. Checks that could not be tied to a regression were removed rather than left as decoration — the four extra top-10 checks were provably identical to `clean top-10` in every run, because all five well-formed variants build the same query and are handed the same ten rows. In their place the gate now checks that the formatting variant scores *identically* to clean (which is what actually verifies sanitization), gates the worst of the three missing-clue variants, and checks `handle_name` retrieval recall on its own. That last one earns its place: reverting the AND-as-preference change moves handle-tier recall from 0.225 to 0.005 while aggregate recall only slips from 0.933 to 0.909 and clears its own threshold, so the aggregate alone would let that regression through.
 
+### Multi-turn refinement
+
+Measure whether saying *more* about a person brings them onto the visible screen:
+
+```powershell
+python -m mock_x_platform.refinement --scope both --order both
+```
+
+Each evaluation case becomes a ladder. The sender leads with a name and a company, adds one clue per turn (role, location, school), and every ladder ends by giving the handle. A turn's type is read off the stored profile rather than assumed: a clue whose tokens all appear in the bio or location is `on_profile` and could in principle discriminate, one whose tokens do not is `off_profile` and provably cannot, whatever the ranker does with it. A turn that corrects the display name is `narrowing_name` — the only search turn that changes the query. Timestamped JSON and row-level CSV land in `.cache/refinement/`, and every report carries what the same run would have cost against the real X API.
+
+#### What the measurement found
+
+1,000 cases, 4,033 turns, 100,000-profile corpus, seed 42:
+
+| turn type | turns | visible | improved | worsened | re-retrieved |
+|---|---|---|---|---|---|
+| `on_profile` | 2,088 | 16.7% | 77 | 0 | 0 |
+| `off_profile` | 912 | 19.7% | 0 | 29 | 0 |
+| `narrowing_name` | 33 | 33.3% | 11 | 0 | 33 |
+| `handle` | 1,000 | 100% | 878 | 0 | 1,000 |
+
+Convergence by search 18.7%, mean turns to visible 0.24, 29 monotonicity violations, 5.8% structurally unconvergeable under `bm25` (7.6% under `follower_weighted`), $0.0872 per case — $87.18 for the run, 46.6 profiles per convergence.
+
+Read per case, of 1,000 recipient searches: **176 (17.6%) were already on screen before any refinement, 11 (1.1%) were rescued by speaking more, and 813 (81.3%) were reachable only by giving the handle.** None was unreachable by every path. Every one of the 11 rescues came from a `narrowing_name` turn.
+
+**Adding clues does not re-retrieve.** Across 3,000 `on_profile` and `off_profile` turns the retrieved set never changed once, because `build_search_query` is name-primary: those clues re-*rank* the same ten rows rather than fetching different ones. Only `narrowing_name` alters the query, and it is the only turn type with a non-zero `retrieval_changed`. This is why there is no "fetch more depth on demand" feature here — there is nothing for extra depth to find that the query did not already ask for.
+
+**Saying something true that the profile does not say makes things worse.** `off_profile` turns produced zero improvements and 29 demotions. On a device where the user cannot see why a result moved, a refinement that quietly demotes the right person is worse than one that does nothing.
+
+The product conclusion is the third row of the per-case reading: **for a saturated name space, the handle is the only reliable path**, which is what the separate handle button on the recipient screen exists for.
+
+#### Reading a sweep
+
+`match_scope` and `result_order` in a report name the store settings that produced it. They do not, on their own, make a run under a different setting a second measurement. Each report therefore also carries `observation_digest` and its two halves in `digest_parts`:
+
+- **`turns`** — every turn's `(case_id, turn_index, rank, visible, retrieval_changed)`. What a user would have seen.
+- **`cases`** — every case's `(reachable, profiles_purchased)`. What was true behind the screen.
+
+Across all four scope × order combinations of the run above, the `turns` digest is a **single** value: no flag moved any rank on any turn of any case. The `cases` digest does move — `result_order` shifts `unconvergeable_cases` between 58 and 76 because reachability is probed 1,000 profiles deep while a turn only ever sees ten, and `name_username_bio` buys 14 more profiles ($87.32 against $87.18). So the two flags change what is *measurable*, never what is *seen*, and the sweep says exactly that rather than reporting one measurement four times. Compare digests before quoting two reports as a sensitivity check.
+
 ## Offline voice input
 
 Voice support is optional and does not add weight to typed-only installations. It uses [python-sounddevice](https://python-sounddevice.readthedocs.io/) for microphone capture and [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with CPU INT8 inference by default.
