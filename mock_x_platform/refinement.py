@@ -646,8 +646,8 @@ def _print_summary(summary: dict[str, Any], json_path: Path, csv_path: Path) -> 
     )
     print(
         f"  observation digest      {summary['observation_digest'][:16]}"
-        "   (same digest as another run = same rows, same ranks: that flag was"
-        " inert, not a second measurement)"
+        "   (same digest as another run = same ranks, same reachability, same"
+        " purchases: that flag was inert, not a second measurement)"
     )
     print(f"JSON report: {json_path}")
     print(f"CSV detail: {csv_path}")
@@ -730,7 +730,10 @@ def _flag_sensitivity_line(
             "setting, so those reports are one measurement, not several"
         )
     if moved:
-        parts.append(f"{' and '.join(moved)} moved the observed rows")
+        parts.append(
+            f"{' and '.join(moved)} changed what the run observed -- those "
+            "reports are separate measurements"
+        )
     return f"\nFlag sensitivity: {'; '.join(parts)}."
 
 

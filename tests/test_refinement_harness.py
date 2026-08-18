@@ -646,9 +646,11 @@ def test_the_sweep_names_the_flags_that_moved_nothing(tmp_path, capsys) -> None:
 
 
 def test_the_sweep_line_separates_an_inert_flag_from_one_that_moved() -> None:
-    # The corpus cannot currently produce a flag that moves anything, so the
-    # other branch of the sweep's verdict is pinned directly. Without this, a
-    # line that said "inert" unconditionally would pass every other test here.
+    # Pinned directly rather than through a run: no corpus small enough to build
+    # in a test is flag-sensitive, and on the 100k corpus it is result_order --
+    # through per-case reachability, not through any turn -- that moves. Without
+    # this, a line that said "inert" unconditionally would pass every other test
+    # here.
     from mock_x_platform.refinement import _flag_sensitivity_line
 
     scopes = ["name_username", "name_username_bio"]
@@ -665,7 +667,8 @@ def test_the_sweep_line_separates_an_inert_flag_from_one_that_moved() -> None:
     )
 
     assert "match_scope inert" in line
-    assert "result_order moved the observed rows" in line
+    assert "result_order changed what the run observed" in line
+    assert "separate measurements" in line
 
 
 def test_a_single_combination_run_says_it_has_nothing_to_compare() -> None:
