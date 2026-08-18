@@ -464,6 +464,15 @@ def _summarize(
         # FLAG_SENSITIVITY_NOTE -- without it a reader has no way to tell a
         # sensitivity check from the same measurement filed twice.
         "observation_digest": _observation_digest(rows, per_case),
+        # Published separately because the halves answer different questions and
+        # a flag can move one without the other. On the 100k corpus result_order
+        # moves `cases` (reachability is probed 1000 deep) while `turns` is
+        # identical -- so it changes what the measurement says without ever
+        # changing what a user would have seen, and only the split can say that.
+        "digest_parts": {
+            "turns": _turn_digest(rows),
+            "cases": _case_digest(per_case),
+        },
         "flag_sensitivity": FLAG_SENSITIVITY_NOTE,
         "seed": seed,
         "case_count": len(cases),
@@ -562,6 +571,16 @@ def _observation_digest(
     """
 
     digest = hashlib.sha256()
+    digest.update(_turn_digest(rows).encode("ascii"))
+    digest.update(b"\x1d")
+    digest.update(_case_digest(per_case).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _turn_digest(rows: list[dict[str, Any]]) -> str:
+    """The half of the fingerprint covering what each turn put on the screen."""
+
+    digest = hashlib.sha256()
     for row in rows:
         digest.update(
             "\x1f".join(
@@ -575,7 +594,13 @@ def _observation_digest(
             ).encode("utf-8")
         )
         digest.update(b"\x1e")
-    digest.update(b"\x1d")
+    return digest.hexdigest()
+
+
+def _case_digest(per_case: list[dict[str, Any]]) -> str:
+    """The half covering what was true of each case behind the screen."""
+
+    digest = hashlib.sha256()
     for item in per_case:
         digest.update(
             "\x1f".join(
@@ -675,7 +700,7 @@ def main() -> int:
     args = parser.parse_args()
     scopes = list(MATCH_SCOPES) if args.scope == "both" else [args.scope]
     orders = list(RESULT_ORDERS) if args.order == "both" else [args.order]
-    digests: dict[tuple[str, str], str] = {}
+    digests: dict[tuple[str, str], tuple[str, str]] = {}
     for scope in scopes:
         for order in orders:
             summary, _, _ = run_refinement(
@@ -686,20 +711,30 @@ def main() -> int:
                 result_order=order,
                 seed=args.seed,
             )
-            digests[(scope, order)] = summary["observation_digest"]
+            parts = summary["digest_parts"]
+            digests[(scope, order)] = (parts["turns"], parts["cases"])
     print(_flag_sensitivity_line(digests, scopes, orders))
     return 0
 
 
 def _flag_sensitivity_line(
-    digests: dict[tuple[str, str], str], scopes: list[str], orders: list[str]
+    digests: dict[tuple[str, str], tuple[str, str]],
+    scopes: list[str],
+    orders: list[str],
 ) -> str:
-    """Say which of the swept flags moved nothing, from the digests just produced.
+    """Say what each swept flag moved, from the digests just produced.
 
     The sweep is the only place that has every combination in hand, so it is the
     only place that can answer this without a human diffing report files. A flag
     counts as inert when changing it leaves the digest identical at every setting
     of the other flag -- not merely at one of them.
+
+    Three verdicts, not two, because the two-verdict version was wrong in both
+    directions on this corpus. `result_order` leaves every turn of every case
+    identical but moves per-case reachability, so calling it inert hides a real
+    difference in `unconvergeable_cases` and calling it "moved" implies the user
+    would have seen something different. Neither is the finding. The finding is
+    that it changes what is reachable behind the screen and nothing on it.
     """
 
     swept = [
@@ -713,26 +748,45 @@ def _flag_sensitivity_line(
             "Sweep --scope both --order both to find out whether either flag "
             "moves anything on this corpus."
         )
-    inert = []
-    if len(scopes) > 1 and all(
-        len({digests[(scope, order)] for scope in scopes}) == 1 for order in orders
-    ):
-        inert.append("match_scope")
-    if len(orders) > 1 and all(
-        len({digests[(scope, order)] for order in orders}) == 1 for scope in scopes
-    ):
-        inert.append("result_order")
-    moved = [name for name in swept if name not in inert]
+
+    def _constant(name: str, half: int) -> bool:
+        """Does this half of the digest survive every change to `name`?"""
+
+        if name == "match_scope":
+            return all(
+                len({digests[(scope, order)][half] for scope in scopes}) == 1
+                for order in orders
+            )
+        return all(
+            len({digests[(scope, order)][half] for order in orders}) == 1
+            for scope in scopes
+        )
+
+    inert, behind_screen, moved = [], [], []
+    for name in swept:
+        if _constant(name, 0) and _constant(name, 1):
+            inert.append(name)
+        elif _constant(name, 0):
+            behind_screen.append(name)
+        else:
+            moved.append(name)
     parts = []
     if inert:
         parts.append(
             f"{' and '.join(inert)} inert -- identical observation_digest at every "
             "setting, so those reports are one measurement, not several"
         )
+    if behind_screen:
+        parts.append(
+            f"{' and '.join(behind_screen)} moved only what is behind the screen "
+            "(reachability, profiles bought) -- every turn of every case put the "
+            "target at the same rank, so those reports differ in what was "
+            "measurable, not in what a user would have seen"
+        )
     if moved:
         parts.append(
-            f"{' and '.join(moved)} changed what the run observed -- those "
-            "reports are separate measurements"
+            f"{' and '.join(moved)} changed the observed turns -- those reports "
+            "are separate measurements"
         )
     return f"\nFlag sensitivity: {'; '.join(parts)}."
 

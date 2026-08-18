@@ -645,30 +645,60 @@ def test_the_sweep_names_the_flags_that_moved_nothing(tmp_path, capsys) -> None:
     assert "moved" not in line
 
 
-def test_the_sweep_line_separates_an_inert_flag_from_one_that_moved() -> None:
-    # Pinned directly rather than through a run: no corpus small enough to build
-    # in a test is flag-sensitive, and on the 100k corpus it is result_order --
-    # through per-case reachability, not through any turn -- that moves. Without
-    # this, a line that said "inert" unconditionally would pass every other test
-    # here.
+SCOPES = ["name_username", "name_username_bio"]
+ORDERS = ["bm25", "follower_weighted"]
+
+
+def _sweep_line(turns_by_order: dict[str, str], cases_by_order: dict[str, str]) -> str:
+    """A four-combination sweep where only `result_order` can differ."""
+
     from mock_x_platform.refinement import _flag_sensitivity_line
 
-    scopes = ["name_username", "name_username_bio"]
-    orders = ["bm25", "follower_weighted"]
-    line = _flag_sensitivity_line(
+    return _flag_sensitivity_line(
         {
-            ("name_username", "bm25"): "aaa",
-            ("name_username", "follower_weighted"): "bbb",
-            ("name_username_bio", "bm25"): "aaa",
-            ("name_username_bio", "follower_weighted"): "bbb",
+            (scope, order): (turns_by_order[order], cases_by_order[order])
+            for scope in SCOPES
+            for order in ORDERS
         },
-        scopes,
-        orders,
+        SCOPES,
+        ORDERS,
+    )
+
+
+def test_the_sweep_line_separates_an_inert_flag_from_one_that_moved() -> None:
+    # Pinned directly rather than through a run: no corpus small enough to build
+    # in a test is flag-sensitive. Without this, a line that said "inert"
+    # unconditionally would pass every other test here.
+    line = _sweep_line(
+        {"bm25": "turns-a", "follower_weighted": "turns-b"},
+        {"bm25": "cases-a", "follower_weighted": "cases-b"},
     )
 
     assert "match_scope inert" in line
-    assert "result_order changed what the run observed" in line
+    assert "result_order changed the observed turns" in line
     assert "separate measurements" in line
+
+
+def test_a_flag_that_moves_only_reachability_is_reported_as_neither() -> None:
+    # The actual shape of this corpus, and the reason the verdict has three
+    # branches rather than two. result_order leaves every turn of every case
+    # identical -- same target, same rank, same screen -- while moving
+    # unconvergeable_cases from 58 to 76, because _reachable probes 1000 deep
+    # and a turn only ever sees ten. "Inert" hides that difference; "changed the
+    # observed turns" claims a user would have seen something else. Both are
+    # false, and a two-branch verdict has to pick one of them.
+    line = _sweep_line(
+        {"bm25": "turns-same", "follower_weighted": "turns-same"},
+        {"bm25": "cases-a", "follower_weighted": "cases-b"},
+    )
+
+    assert "result_order moved only what is behind the screen" in line
+    assert "same rank" in line
+    # match_scope is genuinely inert in this fixture and is named as such; the
+    # point is that result_order lands in neither of the other two verdicts.
+    assert "match_scope inert" in line
+    assert "result_order inert" not in line
+    assert "changed the observed turns" not in line
 
 
 def test_a_single_combination_run_says_it_has_nothing_to_compare() -> None:
